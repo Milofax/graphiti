@@ -119,24 +119,19 @@ class LLMClientFactory:
 
                 from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
 
-                # Use configured small_model, or auto-detect based on main model type
-                if config.small_model:
-                    small_model = config.small_model
-                    is_reasoning_model = (
-                        config.model.startswith('gpt-5')
-                        or config.model.startswith('o1')
-                        or config.model.startswith('o3')
-                    )
+                # Use configured small_model, or fall back to main model
+                small_model = config.small_model or config.model
+
+                # Check if using a reasoning model (for special parameters)
+                # Use explicit config if set, otherwise auto-detect from model name
+                if config.is_reasoning is not None:
+                    is_reasoning_model = config.is_reasoning
                 else:
-                    # Determine appropriate small model based on main model type
                     is_reasoning_model = (
                         config.model.startswith('gpt-5')
                         or config.model.startswith('o1')
                         or config.model.startswith('o3')
                     )
-                    small_model = (
-                        'gpt-5-nano' if is_reasoning_model else 'gpt-4.1-mini'
-                    )  # Use reasoning model for small tasks if main model is reasoning
 
                 llm_config = CoreLLMConfig(
                     api_key=api_key,

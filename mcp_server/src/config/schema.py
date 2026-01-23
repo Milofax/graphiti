@@ -166,6 +166,10 @@ class LLMConfig(BaseModel):
     small_model: str | None = Field(
         default=None, description='Small model for lightweight tasks (optional, auto-detected if not set)'
     )
+    is_reasoning: bool | None = Field(
+        default=None,
+        description='Whether the model is a reasoning model (optional, auto-detected for gpt-5/o1/o3)',
+    )
     temperature: float | None = Field(
         default=None, description='Temperature (optional, defaults to None for reasoning models)'
     )
