@@ -13,6 +13,7 @@ llm:
   model: ${LLM_MODEL:gpt-4o-mini}
   small_model: ${LLM_SMALL_MODEL:}  # Optional: Model for lightweight tasks (defaults to main model)
   is_reasoning: ${LLM_IS_REASONING:}  # Optional: Set true for reasoning models
+  small_is_reasoning: ${LLM_SMALL_IS_REASONING:}  # Optional: Set true if small model is a reasoning model
   max_tokens: 4096
 
   providers:

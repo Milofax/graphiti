@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
 import typing
 
 from openai import AsyncOpenAI
@@ -22,6 +23,8 @@ from pydantic import BaseModel
 
 from .config import DEFAULT_MAX_TOKENS, LLMConfig
 from .openai_base_client import DEFAULT_REASONING, DEFAULT_VERBOSITY, BaseOpenAIClient
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAIClient(BaseOpenAIClient):

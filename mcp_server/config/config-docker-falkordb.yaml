@@ -19,6 +19,7 @@ llm:
                                      # For Ollama/local LLMs: set to same as main model
   is_reasoning: ${LLM_IS_REASONING:}  # Optional: Set true for reasoning models
                                        # Auto-detected for gpt-5/o1/o3 if not set
+  small_is_reasoning: ${LLM_SMALL_IS_REASONING:}  # Optional: Set true if small model is a reasoning model
   max_tokens: 4096
 
   providers:
