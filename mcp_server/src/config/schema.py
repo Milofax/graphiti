@@ -166,6 +166,12 @@ class LLMConfig(BaseModel):
     small_model: str | None = Field(
         default=None, description='Small model for lightweight tasks (optional, auto-detected if not set)'
     )
+    is_reasoning: bool = Field(
+        default=False, description='Main model supports reasoning params (e.g. via proxy)'
+    )
+    small_is_reasoning: bool = Field(
+        default=False, description='Small model supports reasoning params'
+    )
     temperature: float | None = Field(
         default=None, description='Temperature (optional, defaults to None for reasoning models)'
     )

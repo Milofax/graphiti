@@ -43,6 +43,8 @@ class OpenAIClient(BaseOpenAIClient):
         max_tokens: int = DEFAULT_MAX_TOKENS,
         reasoning: str = DEFAULT_REASONING,
         verbosity: str = DEFAULT_VERBOSITY,
+        small_reasoning: str | None = None,
+        small_verbosity: str | None = None,
     ):
         """
         Initialize the OpenAIClient with the provided configuration, cache setting, and client.
@@ -51,8 +53,10 @@ class OpenAIClient(BaseOpenAIClient):
             config (LLMConfig | None): The configuration for the LLM client, including API key, model, base URL, temperature, and max tokens.
             cache (bool): Whether to use caching for responses. Defaults to False.
             client (Any | None): An optional async client instance to use. If not provided, a new AsyncOpenAI client is created.
+            small_reasoning (str | None): Reasoning effort for small model. None disables reasoning params.
+            small_verbosity (str | None): Verbosity for small model. None disables verbosity params.
         """
-        super().__init__(config, cache, max_tokens, reasoning, verbosity)
+        super().__init__(config, cache, max_tokens, reasoning, verbosity, small_reasoning, small_verbosity)
 
         if config is None:
             config = LLMConfig()
@@ -73,9 +77,12 @@ class OpenAIClient(BaseOpenAIClient):
         verbosity: str | None = None,
     ):
         """Create a structured completion using OpenAI's beta parse API."""
-        # Reasoning models (gpt-5 family) don't support temperature
+        # Use reasoning param as source of truth, fallback to prefix check (backward-compat)
         is_reasoning_model = (
-            model.startswith('gpt-5') or model.startswith('o1') or model.startswith('o3')
+            reasoning is not None
+            or model.startswith('gpt-5')
+            or model.startswith('o1')
+            or model.startswith('o3')
         )
 
         request_kwargs = {
@@ -111,9 +118,12 @@ class OpenAIClient(BaseOpenAIClient):
         verbosity: str | None = None,
     ):
         """Create a regular completion with JSON format."""
-        # Reasoning models (gpt-5 family) don't support temperature
+        # Use reasoning param as source of truth, fallback to prefix check (backward-compat)
         is_reasoning_model = (
-            model.startswith('gpt-5') or model.startswith('o1') or model.startswith('o3')
+            reasoning is not None
+            or model.startswith('gpt-5')
+            or model.startswith('o1')
+            or model.startswith('o3')
         )
 
         return await self.client.chat.completions.create(
