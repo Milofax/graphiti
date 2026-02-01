@@ -302,10 +302,19 @@ docker compose -f docker-compose.test.yml down -v
 
 ### Build Standalone Image
 
+> **WICHTIG: Für den Milofax-Fork IMMER `Dockerfile.standalone-local` verwenden!**
+> `Dockerfile.standalone` installiert graphiti-core von PyPI, das die Fork-Features
+> (`small_reasoning`, `small_verbosity`, `base_url` pass-through) NICHT hat.
+> `Dockerfile.standalone-local` baut graphiti-core aus dem lokalen Source.
+
 ```bash
-cd mcp_server
-docker build -f docker/Dockerfile.standalone -t graphiti-mcp:local \
-  --build-arg GRAPHITI_CORE_VERSION=0.26.3 .
+# RICHTIG — Milofax-Fork mit allen Custom-Features (vom Graphiti ROOT!)
+docker build -f mcp_server/docker/Dockerfile.standalone-local -t graphiti-mcp:local .
+
+# NUR für vanilla upstream (OHNE Fork-Features):
+# cd mcp_server
+# docker build -f docker/Dockerfile.standalone -t graphiti-mcp:local \
+#   --build-arg GRAPHITI_CORE_VERSION=0.26.3 .
 ```
 
 ### Configuration
