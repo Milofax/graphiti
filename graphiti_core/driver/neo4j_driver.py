@@ -124,3 +124,109 @@ class Neo4jDriver(GraphDriver):
         except Exception as e:
             print(f'Neo4j health check failed: {e}')
             raise
+
+    async def copy_group(self, source_group_id: str, target_group_id: str) -> None:
+        """
+        Copy all nodes and edges from one group to another using Cypher.
+
+        In Neo4j, group_id is a property on nodes and relationships.
+        Creates new nodes/edges with new UUIDs and the target group_id.
+
+        Note: Requires APOC plugin for dynamic label assignment.
+        """
+        if source_group_id == target_group_id:
+            raise ValueError('Source and target group IDs must be different')
+
+        # Copy all nodes with new UUIDs
+        await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id = $source_group_id
+            WITH n, labels(n) AS lbls, properties(n) AS props
+            CALL {
+                WITH n, lbls, props
+                CREATE (copy)
+                SET copy = props,
+                    copy.uuid = randomUUID(),
+                    copy.group_id = $target_group_id
+                WITH copy, lbls
+                CALL apoc.create.addLabels(copy, lbls) YIELD node
+                RETURN node
+            }
+            RETURN count(*) AS nodes_copied
+            """,
+            source_group_id=source_group_id,
+            target_group_id=target_group_id,
+        )
+
+        logger.info(f'Copied group {source_group_id} to {target_group_id}')
+
+    async def rename_group(self, old_group_id: str, new_group_id: str) -> None:
+        """
+        Rename a group by updating the group_id property on all nodes and edges.
+
+        In Neo4j, this is a simple property update operation.
+        """
+        if old_group_id == new_group_id:
+            raise ValueError('Old and new group IDs must be different')
+
+        # Update all nodes
+        await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id = $old_group_id
+            SET n.group_id = $new_group_id
+            RETURN count(n) AS nodes_updated
+            """,
+            old_group_id=old_group_id,
+            new_group_id=new_group_id,
+        )
+
+        # Update all relationships
+        await self.execute_query(
+            """
+            MATCH ()-[r]->()
+            WHERE r.group_id = $old_group_id
+            SET r.group_id = $new_group_id
+            RETURN count(r) AS edges_updated
+            """,
+            old_group_id=old_group_id,
+            new_group_id=new_group_id,
+        )
+
+        logger.info(f'Renamed group {old_group_id} to {new_group_id}')
+
+    async def list_groups(self) -> list[str]:
+        """
+        List all groups (distinct group_ids) in Neo4j.
+
+        In Neo4j, all groups are in one database, distinguished by group_id property.
+        """
+        records, _, _ = await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id IS NOT NULL
+            RETURN DISTINCT n.group_id AS group_id
+            ORDER BY group_id
+            """,
+            routing_='r',
+        )
+        return [record['group_id'] for record in records]
+
+    async def delete_group(self, group_id: str) -> None:
+        """
+        Delete all nodes and edges belonging to a group.
+
+        In Neo4j, group_id is a property on nodes and relationships.
+        DETACH DELETE removes nodes and their attached relationships.
+        """
+        await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id = $group_id
+            DETACH DELETE n
+            """,
+            group_id=group_id,
+        )
+
+        logger.info(f'Deleted group {group_id}')

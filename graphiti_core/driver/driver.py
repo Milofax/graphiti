@@ -122,3 +122,61 @@ class GraphDriver(ABC):
         Only implemented by providers that need custom fulltext query building.
         """
         raise NotImplementedError(f'build_fulltext_query not implemented for {self.provider}')
+
+    @abstractmethod
+    async def copy_group(self, source_group_id: str, target_group_id: str) -> None:
+        """
+        Copy all data from one group to another.
+
+        Parameters
+        ----------
+        source_group_id : str
+            The source group ID to copy from.
+        target_group_id : str
+            The target group ID to copy to.
+        """
+        ...
+
+    @abstractmethod
+    async def rename_group(self, old_group_id: str, new_group_id: str) -> None:
+        """
+        Rename a group by copying to new name and deleting the old one.
+
+        Parameters
+        ----------
+        old_group_id : str
+            The current group ID.
+        new_group_id : str
+            The new group ID.
+        """
+        ...
+
+    @abstractmethod
+    async def list_groups(self) -> list[str]:
+        """
+        List all available groups/databases.
+
+        For Neo4j: Returns distinct group_ids from nodes.
+        For FalkorDB: Returns all graph names (Redis keys of type 'graphdata').
+
+        Returns
+        -------
+        list[str]
+            List of group/database names.
+        """
+        ...
+
+    @abstractmethod
+    async def delete_group(self, group_id: str) -> None:
+        """
+        Delete an entire group/graph.
+
+        For Neo4j/Kuzu/Neptune: Deletes all nodes and edges with this group_id.
+        For FalkorDB: Deletes the entire Redis graph key.
+
+        Parameters
+        ----------
+        group_id : str
+            The group ID to delete.
+        """
+        ...
