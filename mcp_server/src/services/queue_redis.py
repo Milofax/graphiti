@@ -413,23 +413,24 @@ class RedisStreamsBackend(QueueBackend):
         return 0
 
     async def get_pending_count_async(self, group_id: str) -> int:
-        """Get actual pending (unacknowledged) message count via XPENDING."""
+        """Get total unprocessed message count (pending + lag).
+
+        Returns the sum of:
+        - pending: messages delivered to a consumer but not yet acknowledged
+        - lag: messages in the stream not yet delivered to any consumer
+        """
         if self._redis is None:
             return 0
 
         stream_key = self._stream_key(group_id)
         try:
-            pending_info = await self._redis.xpending(stream_key, self._config.consumer_group)
-            if not pending_info:
-                return 0
-
-            # redis-py returns dict with 'pending' key (decode_responses=True)
-            if isinstance(pending_info, dict):
-                return pending_info.get('pending', 0)
-
-            # Fallback: list format [total, min_id, max_id, consumers]
-            if isinstance(pending_info, list) and len(pending_info) > 0:
-                return int(pending_info[0])
+            groups = await self._redis.xinfo_groups(stream_key)
+            for group in groups:
+                if group.get('name') != self._config.consumer_group:
+                    continue
+                pending = group.get('pending', 0) or 0
+                lag = group.get('lag', 0) or 0
+                return pending + lag
             return 0
         except Exception:
             return 0
@@ -451,17 +452,34 @@ class RedisStreamsBackend(QueueBackend):
                     continue
 
                 group_id = key.removeprefix('graphiti:queue:')
-                pending_count = await self.get_pending_count_async(group_id)
-                total_pending += pending_count
+                stream_key = self._stream_key(group_id)
+
+                pending_count = 0
+                lag_count = 0
+                try:
+                    groups = await self._redis.xinfo_groups(stream_key)
+                    for group in groups:
+                        if group.get('name') != self._config.consumer_group:
+                            continue
+                        pending_count = group.get('pending', 0) or 0
+                        lag_count = group.get('lag', 0) or 0
+                        break
+                except Exception:
+                    pass
+
+                total_count = pending_count + lag_count
+                total_pending += total_count
 
                 is_processing = self._worker_running.get(group_id, False)
                 if is_processing:
                     currently_processing += 1
 
-                if pending_count > 0 or is_processing:
+                if total_count > 0 or is_processing:
                     groups_info.append({
                         'group_id': group_id,
                         'pending': pending_count,
+                        'queued': lag_count,
+                        'total': total_count,
                         'processing': is_processing,
                     })
         except Exception as e:
