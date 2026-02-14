@@ -14,7 +14,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
-from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
@@ -24,10 +24,12 @@ from starlette.responses import JSONResponse
 
 from config.schema import GraphitiConfig, ServerConfig
 from models.response_types import (
+    EdgeListResponse,
     EntityTypesResponse,
     EpisodeSearchResponse,
     ErrorResponse,
     FactSearchResponse,
+    NodeListResponse,
     NodeResult,
     NodeSearchResponse,
     StatusResponse,
@@ -421,35 +423,39 @@ async def add_memory(
     This function returns immediately and processes the episode addition in the background.
     Episodes for the same group_id are processed sequentially to avoid race conditions.
 
+    IMPORTANT - Entity Resolution Best Practices:
+    - Use natural language (source='text') for best entity matching with existing nodes
+    - Be consistent with entity names across episodes (e.g., always "Tank" not sometimes "Panzer")
+    - Use the same language consistently within a graph to improve entity resolution
+    - JSON source may create entities that don't match well with text-based entities
+
     Args:
         name (str): Name of the episode
-        episode_body (str): The content of the episode to persist to memory. When source='json', this must be a
-                           properly escaped JSON string, not a raw Python dictionary. The JSON data will be
-                           automatically processed to extract entities and relationships.
+        episode_body (str): The content of the episode to persist to memory.
+                           RECOMMENDED: Use natural language sentences for better entity resolution.
+                           When source='json', this must be a properly escaped JSON string.
         group_id (str, optional): A unique ID for this graph. If not provided, uses the default group_id from CLI
                                  or a generated one.
         source (str, optional): Source type, must be one of:
-                               - 'text': For plain text content (default)
-                               - 'json': For structured data
+                               - 'text': For plain text content (default, RECOMMENDED for entity resolution)
+                               - 'json': For structured data (may create entities that don't merge well)
                                - 'message': For conversation-style content
         source_description (str, optional): Description of the source
         uuid (str, optional): Optional UUID for the episode
 
     Examples:
-        # Adding plain text content
+        # RECOMMENDED: Natural language for better entity resolution
         add_memory(
-            name="Company News",
-            episode_body="Acme Corp announced a new product line today.",
+            name="Game Stats",
+            episode_body="The Tank entity has 100 hit points and deals 25 damage per shot.",
             source="text",
-            source_description="news article",
-            group_id="some_arbitrary_string"
+            source_description="game documentation"
         )
 
-        # Adding structured JSON data
-        # NOTE: episode_body should be a JSON string (standard JSON escaping)
+        # JSON (use only when structure is essential, entity matching may be worse)
         add_memory(
             name="Customer Profile",
-            episode_body='{"company": {"name": "Acme Technologies"}, "products": [{"id": "P001", "name": "CloudSync"}, {"id": "P002", "name": "DataMiner"}]}',
+            episode_body='{"company": {"name": "Acme Technologies"}, "products": [{"id": "P001", "name": "CloudSync"}]}',
             source="json",
             source_description="CRM data"
         )
@@ -883,6 +889,438 @@ async def get_entity_types() -> EntityTypesResponse | ErrorResponse:
         return ErrorResponse(error=f'Error getting entity types: {error_msg}')
 
 
+@mcp.tool()
+async def get_entity_node(uuid: str) -> dict[str, Any] | ErrorResponse:
+    """Get an entity node from the graph memory by its UUID.
+
+    Args:
+        uuid: UUID of the entity node to retrieve
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+        entity_node = await EntityNode.get_by_uuid(client.driver, uuid)
+        return format_node_result(entity_node)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting entity node: {error_msg}')
+        return ErrorResponse(error=f'Error getting entity node: {error_msg}')
+
+
+@mcp.tool()
+async def get_entity_edges_by_node(
+    node_uuid: str,
+) -> FactSearchResponse | ErrorResponse:
+    """Get all entity edges (facts/relationships) connected to a specific node.
+
+    This is useful for:
+    - Seeing all relationships of an entity before modifying or deleting it
+    - Finding edges that need to be moved when merging duplicate nodes
+    - Understanding the context of a specific entity
+
+    Args:
+        node_uuid: UUID of the entity node to get edges for
+
+    Returns:
+        List of all edges where this node is either source or target
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+
+        # Get all edges connected to this node
+        edges = await EntityEdge.get_by_node_uuid(client.driver, node_uuid)
+
+        facts = [format_fact_result(edge) for edge in edges]
+
+        return FactSearchResponse(
+            message=f'Found {len(facts)} edges connected to node {node_uuid}',
+            facts=facts,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting edges by node: {error_msg}')
+        return ErrorResponse(error=f'Error getting edges by node: {error_msg}')
+
+
+@mcp.tool()
+async def list_nodes(
+    group_id: str | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> NodeListResponse | ErrorResponse:
+    """List all entity nodes in a graph with pagination support.
+
+    Use this tool to:
+    - Get an overview of all entities in a graph
+    - Find duplicate nodes (same or similar names)
+    - Identify orphan nodes or data quality issues
+    - Browse the graph structure without semantic search
+
+    Args:
+        group_id: Graph to list nodes from. Uses default if not provided.
+        limit: Maximum number of nodes to return (default: 100, max: 500)
+        cursor: UUID cursor for pagination. Pass the next_cursor from previous response.
+
+    Returns:
+        List of nodes with pagination info. Use next_cursor for subsequent pages.
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+
+        # Use the provided group_id or fall back to the default from config
+        effective_group_id = group_id or config.graphiti.group_id
+
+        if not effective_group_id:
+            return ErrorResponse(error='No group_id provided and no default configured')
+
+        # Clamp limit to reasonable bounds
+        effective_limit = min(max(1, limit), 500)
+
+        # Get nodes with pagination (request one extra to check if there are more)
+        nodes = await client.get_entities_by_group_id(
+            group_id=effective_group_id,
+            limit=effective_limit + 1,
+            uuid_cursor=cursor,
+        )
+
+        # Check if there are more results
+        has_more = len(nodes) > effective_limit
+        if has_more:
+            nodes = nodes[:effective_limit]
+
+        # Format results
+        node_results = [format_node_result(node) for node in nodes]
+
+        # Determine next cursor
+        next_cursor = nodes[-1].uuid if has_more and nodes else None
+
+        return NodeListResponse(
+            message=f'Found {len(node_results)} nodes in group {effective_group_id}',
+            nodes=node_results,
+            total=len(node_results),
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error listing nodes: {error_msg}')
+        return ErrorResponse(error=f'Error listing nodes: {error_msg}')
+
+
+@mcp.tool()
+async def list_edges(
+    group_id: str | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> EdgeListResponse | ErrorResponse:
+    """List all entity edges (facts/relationships) in a graph with pagination support.
+
+    Use this tool to:
+    - Get an overview of all relationships in a graph
+    - Find redundant or duplicate edges
+    - Analyze graph connectivity
+    - Browse facts without semantic search
+
+    Args:
+        group_id: Graph to list edges from. Uses default if not provided.
+        limit: Maximum number of edges to return (default: 100, max: 500)
+        cursor: UUID cursor for pagination. Pass the next_cursor from previous response.
+
+    Returns:
+        List of edges with pagination info. Use next_cursor for subsequent pages.
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+
+        # Use the provided group_id or fall back to the default from config
+        effective_group_id = group_id or config.graphiti.group_id
+
+        if not effective_group_id:
+            return ErrorResponse(error='No group_id provided and no default configured')
+
+        # Clamp limit to reasonable bounds
+        effective_limit = min(max(1, limit), 500)
+
+        # Get edges with pagination (request one extra to check if there are more)
+        edges = await client.get_edges_by_group_id(
+            group_id=effective_group_id,
+            limit=effective_limit + 1,
+            uuid_cursor=cursor,
+        )
+
+        # Check if there are more results
+        has_more = len(edges) > effective_limit
+        if has_more:
+            edges = edges[:effective_limit]
+
+        # Format results
+        edge_results = [format_fact_result(edge) for edge in edges]
+
+        # Determine next cursor
+        next_cursor = edges[-1].uuid if has_more and edges else None
+
+        return EdgeListResponse(
+            message=f'Found {len(edge_results)} edges in group {effective_group_id}',
+            edges=edge_results,
+            total=len(edge_results),
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error listing edges: {error_msg}')
+        return ErrorResponse(error=f'Error listing edges: {error_msg}')
+
+
+@mcp.tool()
+async def update_entity_node(
+    uuid: str,
+    name: str | None = None,
+    summary: str | None = None,
+    labels: list[str] | None = None,
+    attributes: dict[str, Any] | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Update an existing entity node in the graph memory.
+
+    Use this tool to modify an existing entity when you know its UUID.
+    This is preferred over add_memory when correcting facts about existing entities,
+    as it ensures the correction is applied to the correct node without creating duplicates.
+
+    Args:
+        uuid: UUID of the entity node to update (required)
+        name: New name for the entity (optional)
+        summary: New summary for the entity (optional)
+        labels: New labels for the entity, replaces existing labels (optional)
+        attributes: Attributes to merge into existing attributes (optional)
+
+    Returns:
+        The updated entity node data, or an error response
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+
+        # Get the existing entity node
+        entity_node = await EntityNode.get_by_uuid(client.driver, uuid)
+
+        # Track what was changed for logging
+        changes = []
+
+        # Update fields if provided
+        if name is not None and name != entity_node.name:
+            entity_node.name = name
+            changes.append(f'name -> "{name}"')
+
+        if summary is not None and summary != entity_node.summary:
+            entity_node.summary = summary
+            changes.append(f'summary updated')
+
+        if labels is not None:
+            entity_node.labels = labels
+            changes.append(f'labels -> {labels}')
+
+        if attributes is not None:
+            # Merge new attributes into existing ones
+            entity_node.attributes = {**entity_node.attributes, **attributes}
+            changes.append(f'attributes merged: {list(attributes.keys())}')
+
+        if not changes:
+            return format_node_result(entity_node)
+
+        # Regenerate embeddings if name or summary changed
+        if name is not None:
+            await entity_node.generate_name_embedding(client.llm_client.embedder)
+        if summary is not None:
+            await entity_node.generate_summary_embedding(client.llm_client.embedder)
+
+        # Save the updated node
+        await entity_node.save(client.driver)
+
+        logger.info(f'Updated entity {uuid}: {", ".join(changes)}')
+
+        return format_node_result(entity_node)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error updating entity: {error_msg}')
+        return ErrorResponse(error=f'Error updating entity: {error_msg}')
+
+
+@mcp.tool()
+async def update_entity_edge(
+    uuid: str,
+    source_node_uuid: str | None = None,
+    target_node_uuid: str | None = None,
+    fact: str | None = None,
+    name: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Update an existing entity edge (fact/relationship) in the graph memory.
+
+    Use this tool to modify an edge's endpoints or content. This is particularly useful for:
+    - Moving edges from duplicate nodes to the original node (merging duplicates)
+    - Correcting the fact text of an existing relationship
+    - Changing the relationship type (name)
+
+    Args:
+        uuid: UUID of the entity edge to update (required)
+        source_node_uuid: New source node UUID (optional, must exist)
+        target_node_uuid: New target node UUID (optional, must exist)
+        fact: New fact text describing the relationship (optional)
+        name: New relationship type name in UPPER_SNAKE_CASE (optional)
+
+    Returns:
+        The updated entity edge data, or an error response
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+
+        # Get the existing edge
+        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+
+        # Track changes and detect endpoint changes
+        changes = []
+        endpoints_changed = False
+        original_source = entity_edge.source_node_uuid
+        original_target = entity_edge.target_node_uuid
+
+        # Validate and update source node
+        if source_node_uuid is not None and source_node_uuid != entity_edge.source_node_uuid:
+            # Verify the new source node exists
+            await EntityNode.get_by_uuid(client.driver, source_node_uuid)
+            entity_edge.source_node_uuid = source_node_uuid
+            changes.append(f'source_node_uuid -> {source_node_uuid}')
+            endpoints_changed = True
+
+        # Validate and update target node
+        if target_node_uuid is not None and target_node_uuid != entity_edge.target_node_uuid:
+            # Verify the new target node exists
+            await EntityNode.get_by_uuid(client.driver, target_node_uuid)
+            entity_edge.target_node_uuid = target_node_uuid
+            changes.append(f'target_node_uuid -> {target_node_uuid}')
+            endpoints_changed = True
+
+        # Update fact text
+        if fact is not None and fact != entity_edge.fact:
+            entity_edge.fact = fact
+            changes.append('fact updated')
+
+        # Update relationship name
+        if name is not None and name != entity_edge.name:
+            entity_edge.name = name
+            changes.append(f'name -> {name}')
+
+        if not changes:
+            return format_fact_result(entity_edge)
+
+        # Regenerate fact embedding if fact changed
+        if fact is not None:
+            await entity_edge.generate_embedding(client.llm_client.embedder)
+
+        # If endpoints changed, we must delete old edge first then create new one
+        # (Graph DBs don't allow changing edge endpoints in place)
+        if endpoints_changed:
+            # Delete the old edge using direct query to ensure it's removed
+            await client.driver.execute_query(
+                """
+                MATCH (:Entity {uuid: $source_uuid})-[e:RELATES_TO {uuid: $edge_uuid}]->(:Entity {uuid: $target_uuid})
+                DELETE e
+                """,
+                source_uuid=original_source,
+                target_uuid=original_target,
+                edge_uuid=uuid,
+            )
+            logger.info(f'Deleted old edge {uuid} from {original_source} -> {original_target}')
+
+        # Save the edge (creates new if endpoints changed, updates if not)
+        await entity_edge.save(client.driver)
+
+        logger.info(f'Updated entity edge {uuid}: {", ".join(changes)}')
+
+        return format_fact_result(entity_edge)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error updating entity edge: {error_msg}')
+        return ErrorResponse(error=f'Error updating entity edge: {error_msg}')
+
+
+@mcp.tool()
+async def delete_entity_node(uuid: str) -> SuccessResponse | ErrorResponse:
+    """Delete an entity node from the graph memory.
+
+    IMPORTANT: This will permanently delete all edges connected to this node!
+
+    When merging duplicate nodes, use this workflow instead:
+    1. Use get_entity_edges_by_node() to list all edges of the duplicate node
+    2. Use update_entity_edge() to move each edge to the correct node
+    3. Only then use delete_entity_node() to remove the orphaned duplicate
+
+    Args:
+        uuid: UUID of the entity node to delete
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+
+        # First check how many edges are connected
+        edges = await EntityEdge.get_by_node_uuid(client.driver, uuid)
+
+        # Get the node to verify it exists and get its name
+        entity_node = await EntityNode.get_by_uuid(client.driver, uuid)
+
+        if edges:
+            logger.warning(
+                f'Deleting entity node {uuid} ({entity_node.name}) '
+                f'with {len(edges)} connected edges'
+            )
+
+        # Delete all connected edges first
+        for edge in edges:
+            await edge.delete(client.driver)
+
+        # Delete the node
+        await entity_node.delete(client.driver)
+
+        return SuccessResponse(
+            message=f'Deleted entity node "{entity_node.name}" ({uuid}) '
+            f'and {len(edges)} connected edges'
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error deleting entity node: {error_msg}')
+        return ErrorResponse(error=f'Error deleting entity node: {error_msg}')
+
+
 @mcp.custom_route('/health', methods=['GET'])
 async def health_check(request) -> JSONResponse:
     """Health check endpoint for Docker and load balancers."""
@@ -1022,6 +1460,63 @@ async def http_delete_entity_type(request) -> JSONResponse:
     except Exception as e:
         logger.error(f'Error deleting entity type: {e}')
         return JSONResponse({'error': 'Internal error deleting entity type'}, status_code=500)
+
+
+# =============================================================================
+# HTTP Endpoints for Groups and Stats (DB-neutral)
+# =============================================================================
+
+
+@mcp.custom_route('/groups', methods=['GET'])
+async def http_get_groups(request) -> JSONResponse:
+    """Get all available group IDs from the database.
+
+    Uses the DB-neutral Graphiti.get_groups() method which delegates to
+    the driver's list_groups() implementation (works for all 4 DB providers).
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return JSONResponse({'error': 'Graphiti service not initialized'}, status_code=500)
+
+    try:
+        client = await graphiti_service.get_client()
+        groups = await client.get_groups()
+        return JSONResponse({'groups': groups})
+
+    except Exception as e:
+        logger.error(f'Error getting groups: {e}')
+        return JSONResponse({'error': 'Internal server error'}, status_code=500)
+
+
+@mcp.custom_route('/stats', methods=['GET'])
+async def http_get_stats(request) -> JSONResponse:
+    """Get graph statistics.
+
+    Query parameters:
+        - group_id: Optional group ID to filter stats
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return JSONResponse({'error': 'Graphiti service not initialized'}, status_code=500)
+
+    try:
+        client = await graphiti_service.get_client()
+        group_id = request.query_params.get('group_id')
+
+        # Use Graphiti's built-in stats method
+        stats = await client.get_graph_stats(group_id=group_id)
+
+        return JSONResponse({
+            'nodes': stats.get('node_count', 0),
+            'edges': stats.get('edge_count', 0),
+            'episodes': stats.get('episode_count', 0),
+        })
+
+    except Exception as e:
+        logger.error(f'Error getting stats: {e}')
+        return JSONResponse({'error': 'Internal server error'}, status_code=500)
 
 
 async def initialize_server() -> ServerConfig:
