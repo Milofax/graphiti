@@ -41,3 +41,21 @@ class EpisodeSearchResponse(TypedDict):
 class StatusResponse(TypedDict):
     status: str
     message: str
+
+
+class EntityTypeFieldResult(TypedDict):
+    name: str
+    type: str
+    required: bool
+    description: str
+
+
+class EntityTypeResult(TypedDict):
+    name: str
+    description: str
+    fields: list[EntityTypeFieldResult]
+
+
+class EntityTypesResponse(TypedDict):
+    message: str
+    entity_types: list[EntityTypeResult]
