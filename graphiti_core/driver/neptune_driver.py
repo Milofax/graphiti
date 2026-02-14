@@ -274,6 +274,111 @@ class NeptuneDriver(GraphDriver):
 
         return 0
 
+    async def copy_group(self, source_group_id: str, target_group_id: str) -> None:
+        """
+        Copy all nodes from one group to another using Cypher.
+
+        In Neptune, group_id is a property on nodes. Creates new nodes
+        with new UUIDs and the target group_id.
+
+        Note: Relationships are not copied as they reference specific node UUIDs.
+        """
+        import uuid as uuid_mod
+
+        if source_group_id == target_group_id:
+            raise ValueError('Source and target group IDs must be different')
+
+        # Copy all nodes with group_id property
+        result, _, _ = await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id = $source_group_id
+            RETURN properties(n) AS props
+            """,
+            source_group_id=source_group_id,
+        )
+        for record in result:
+            props = record.get('props', {})
+            props['uuid'] = str(uuid_mod.uuid4())
+            props['group_id'] = target_group_id
+            await self.execute_query(
+                """
+                CREATE (copy)
+                SET copy = $props
+                """,
+                props=props,
+            )
+
+        logger.info(f'Copied group {source_group_id} to {target_group_id}')
+
+    async def rename_group(self, old_group_id: str, new_group_id: str) -> None:
+        """
+        Rename a group by updating the group_id property on all nodes and edges.
+
+        In Neptune, this is a simple property update operation.
+        """
+        if old_group_id == new_group_id:
+            raise ValueError('Old and new group IDs must be different')
+
+        # Update all nodes
+        await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id = $old_group_id
+            SET n.group_id = $new_group_id
+            """,
+            old_group_id=old_group_id,
+            new_group_id=new_group_id,
+        )
+
+        # Update all relationships
+        await self.execute_query(
+            """
+            MATCH ()-[r]->()
+            WHERE r.group_id = $old_group_id
+            SET r.group_id = $new_group_id
+            """,
+            old_group_id=old_group_id,
+            new_group_id=new_group_id,
+        )
+
+        logger.info(f'Renamed group {old_group_id} to {new_group_id}')
+
+    async def list_groups(self) -> list[str]:
+        """
+        List all groups (distinct group_ids) in Neptune.
+
+        In Neptune, all groups are in one database, distinguished by group_id property.
+        """
+        records, _, _ = await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id IS NOT NULL
+            RETURN DISTINCT n.group_id AS group_id
+            ORDER BY group_id
+            """,
+        )
+        return [record['group_id'] for record in records]
+
+    async def delete_group(self, group_id: str) -> None:
+        """
+        Delete all nodes and edges belonging to a group.
+
+        In Neptune, group_id is a property on nodes and relationships.
+        This deletes all data with the specified group_id.
+        """
+        # Delete all nodes with this group_id (DETACH DELETE removes relationships too)
+        await self.execute_query(
+            """
+            MATCH (n)
+            WHERE n.group_id = $group_id
+            DETACH DELETE n
+            """,
+            group_id=group_id,
+        )
+
+        logger.info(f'Deleted group {group_id}')
+
 
 class NeptuneDriverSession(GraphDriverSession):
     provider = GraphProvider.NEPTUNE

@@ -24,6 +24,8 @@ from dotenv import load_dotenv
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.edges import EntityEdge, EpisodicEdge
 from graphiti_core.embedder.client import EmbedderClient
+from graphiti_core.llm_client import LLMClient
+from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.helpers import lucene_sanitize
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
@@ -152,6 +154,18 @@ embeddings = {
         'test_entity_2 relates to test_entity_3',
         'test_community_1',
         'test_community_2',
+        # CRUD test entities
+        'CRUD Test Entity',
+        'CRUD Test Entity summary',
+        'CRUD Test Target',
+        'CRUD Test Target summary',
+        'Updated Entity Name',
+        'Updated summary text',
+        'WORKS_ON',
+        'CRUD Test Entity works on CRUD Test Target',
+        'Updated fact text',
+        'Temp Entity',
+        'Entity to delete',
     ]
 }
 embeddings['Alice Smith'] = embeddings['Alice']
@@ -172,6 +186,41 @@ def mock_embedder():
 
     mock_model.create.side_effect = mock_embed
     return mock_model
+
+
+@pytest.fixture
+def mock_llm_client():
+    """Create a mock LLM client for tests that don't need actual LLM calls."""
+    mock_llm = Mock(spec=LLMClient)
+    mock_llm.config = Mock()
+    mock_llm.model = 'test-model'
+    mock_llm.small_model = 'test-small-model'
+    mock_llm.temperature = 0.0
+    mock_llm.max_tokens = 1000
+    mock_llm.cache_enabled = False
+    mock_llm.cache_dir = None
+
+    # Mock the public method that's actually called
+    mock_llm.generate_response = Mock()
+    mock_llm.generate_response.return_value = {
+        'tool_calls': [
+            {
+                'name': 'extract_entities',
+                'arguments': {'entities': [{'entity': 'test_entity', 'entity_type': 'test_type'}]},
+            }
+        ]
+    }
+
+    return mock_llm
+
+
+@pytest.fixture
+def mock_cross_encoder():
+    """Create a mock cross encoder client for tests that don't need actual reranking."""
+    mock_encoder = Mock(spec=CrossEncoderClient)
+    mock_encoder.config = Mock()
+    mock_encoder.rerank = Mock(return_value={})
+    return mock_encoder
 
 
 def test_lucene_sanitize():

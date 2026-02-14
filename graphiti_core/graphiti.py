@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import re
 from datetime import datetime
 from time import time
 
@@ -25,7 +26,7 @@ from typing_extensions import LiteralString
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.decorators import handle_multiple_group_ids
-from graphiti_core.driver.driver import GraphDriver
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import (
     CommunityEdge,
@@ -1538,3 +1539,702 @@ class Graphiti:
         await Node.delete_by_uuids(self.driver, [node.uuid for node in nodes_to_delete])
 
         await episode.delete(self.driver)
+
+    # =========================================================================
+    # CRUD Operations for Entities, Edges, and Episodes
+    # =========================================================================
+
+    async def create_entity(
+        self,
+        name: str,
+        group_id: str,
+        entity_type: str = 'Entity',
+        summary: str = '',
+        attributes: dict | None = None,
+    ) -> EntityNode:
+        """
+        Create a new entity node with auto-generated embeddings.
+
+        Parameters
+        ----------
+        name : str
+            The name of the entity.
+        group_id : str
+            The group ID for graph partitioning.
+        entity_type : str, optional
+            The type/label of the entity. Defaults to 'Entity'.
+        summary : str, optional
+            A summary description of the entity.
+        attributes : dict | None, optional
+            Additional attributes for the entity.
+
+        Returns
+        -------
+        EntityNode
+            The created entity node with embeddings.
+
+        Raises
+        ------
+        ValueError
+            If entity_type contains invalid characters.
+        """
+        # Validate entity_type: only alphanumeric and underscore allowed
+        if entity_type and entity_type != 'Entity':
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', entity_type):
+                raise ValueError(f'Invalid entity_type: must be alphanumeric with underscores, got {entity_type!r}')
+
+        labels = [entity_type] if entity_type and entity_type != 'Entity' else []
+
+        node = EntityNode(
+            name=name,
+            labels=labels,
+            summary=summary,
+            group_id=group_id,
+            attributes=attributes or {},
+            created_at=utc_now(),
+        )
+
+        await node.generate_name_embedding(self.embedder)
+        if summary:
+            await node.generate_summary_embedding(self.embedder)
+
+        # FalkorDB uses separate graphs per group_id, so clone driver to point to correct graph
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB:
+            driver = driver.clone(database=group_id)
+
+        await node.save(driver)
+        return node
+
+    async def get_entity(self, uuid: str, group_id: str | None = None) -> EntityNode:
+        """
+        Retrieve an entity node by UUID.
+
+        Parameters
+        ----------
+        uuid : str
+            The UUID of the entity to retrieve.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+
+        Returns
+        -------
+        EntityNode
+            The entity node.
+
+        Raises
+        ------
+        NodeNotFoundError
+            If no entity with the given UUID exists.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+        return await EntityNode.get_by_uuid(driver, uuid)
+
+    async def update_entity(
+        self,
+        uuid: str,
+        name: str | None = None,
+        summary: str | None = None,
+        entity_type: str | None = None,
+        attributes: dict | None = None,
+        group_id: str | None = None,
+    ) -> EntityNode:
+        """
+        Update an existing entity node. Regenerates embeddings when name or summary changes.
+
+        Parameters
+        ----------
+        uuid : str
+            The UUID of the entity to update.
+        name : str | None, optional
+            New name for the entity. Triggers name embedding regeneration.
+        summary : str | None, optional
+            New summary for the entity. Triggers summary embedding regeneration.
+        entity_type : str | None, optional
+            New entity type/label.
+        attributes : dict | None, optional
+            Attributes to merge into existing attributes.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+
+        Returns
+        -------
+        EntityNode
+            The updated entity node.
+
+        Raises
+        ------
+        NodeNotFoundError
+            If no entity with the given UUID exists.
+        ValueError
+            If entity_type contains invalid characters.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+
+        node = await EntityNode.get_by_uuid(driver, uuid)
+
+        if name is not None and name != node.name:
+            node.name = name
+            await node.generate_name_embedding(self.embedder)
+
+        if summary is not None and summary != node.summary:
+            node.summary = summary
+            if summary:
+                await node.generate_summary_embedding(self.embedder)
+            else:
+                node.summary_embedding = None
+
+        # Handle label changes with explicit REMOVE/SET in database
+        if entity_type is not None:
+            # Validate label name: only alphanumeric and underscore allowed
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', entity_type):
+                raise ValueError(f'Invalid entity_type: must be alphanumeric with underscores, got {entity_type!r}')
+
+            old_labels = node.labels or []
+            new_labels = [entity_type] if entity_type != 'Entity' else []
+
+            # Remove old labels (except Entity which is always present)
+            for old_label in old_labels:
+                if old_label and old_label != 'Entity':
+                    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', old_label):
+                        logger.warning(f'Skipping invalid old label: {old_label!r}')
+                        continue
+                    await driver.execute_query(
+                        f'MATCH (n:Entity {{uuid: $uuid}}) REMOVE n:`{old_label}`',
+                        uuid=uuid,
+                    )
+
+            # Add new label
+            if new_labels:
+                await driver.execute_query(
+                    f'MATCH (n:Entity {{uuid: $uuid}}) SET n:`{new_labels[0]}`',
+                    uuid=uuid,
+                )
+
+            node.labels = new_labels
+
+        if attributes is not None:
+            node.attributes.update(attributes)
+
+        await node.save(driver)
+        return node
+
+    async def remove_entity(self, uuid: str, group_id: str | None = None) -> None:
+        """
+        Remove an entity node by UUID.
+
+        Parameters
+        ----------
+        uuid : str
+            The UUID of the entity to remove.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+
+        Raises
+        ------
+        NodeNotFoundError
+            If no entity with the given UUID exists.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+        node = await EntityNode.get_by_uuid(driver, uuid)
+        await node.delete(driver)
+
+    async def create_edge(
+        self,
+        source_node_uuid: str,
+        target_node_uuid: str,
+        name: str,
+        fact: str,
+        group_id: str,
+        valid_at: datetime | None = None,
+        invalid_at: datetime | None = None,
+        attributes: dict | None = None,
+        source_description: str = 'Manual entry',
+        create_episode: bool = True,
+    ) -> EntityEdge:
+        """
+        Create a new entity edge with auto-generated embedding and optional episode.
+
+        Parameters
+        ----------
+        source_node_uuid : str
+            UUID of the source entity node.
+        target_node_uuid : str
+            UUID of the target entity node.
+        name : str
+            The name/type of the relationship.
+        fact : str
+            A fact statement describing the relationship.
+        group_id : str
+            The group ID for graph partitioning.
+        valid_at : datetime | None, optional
+            When the fact became true.
+        invalid_at : datetime | None, optional
+            When the fact stopped being true.
+        attributes : dict | None, optional
+            Additional attributes for the edge.
+        source_description : str, optional
+            Description of the data source (default: 'Manual entry').
+        create_episode : bool, optional
+            Whether to create an episode for traceability (default: True).
+            Episode is only created if fact is non-empty.
+
+        Returns
+        -------
+        EntityEdge
+            The created entity edge with embedding.
+        """
+        now = utc_now()
+        episode_uuid = None
+
+        # FalkorDB uses separate graphs per group_id, so clone driver to point to correct graph
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB:
+            driver = driver.clone(database=group_id)
+
+        # Create episode for traceability if requested
+        if create_episode and fact:
+            episode = EpisodicNode(
+                name=f'{name}: {fact[:50]}{"..." if len(fact) > 50 else ""}',
+                group_id=group_id,
+                source=EpisodeType.text,
+                source_description=source_description,
+                content=fact,
+                created_at=now,
+                valid_at=valid_at or now,
+            )
+            await episode.save(driver)
+            episode_uuid = episode.uuid
+
+        edge = EntityEdge(
+            source_node_uuid=source_node_uuid,
+            target_node_uuid=target_node_uuid,
+            name=name,
+            fact=fact,
+            group_id=group_id,
+            created_at=now,
+            valid_at=valid_at,
+            invalid_at=invalid_at,
+            attributes=attributes or {},
+            episodes=[episode_uuid] if episode_uuid else [],
+        )
+
+        await edge.generate_embedding(self.embedder)
+        await edge.save(driver)
+
+        # Update episode with edge reference (bidirectional link)
+        if episode_uuid:
+            episode.entity_edges = [edge.uuid]
+            await episode.save(driver)
+
+        return edge
+
+    async def get_edge(self, uuid: str, group_id: str | None = None) -> EntityEdge:
+        """
+        Retrieve an entity edge by UUID.
+
+        Parameters
+        ----------
+        uuid : str
+            The UUID of the edge to retrieve.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+
+        Returns
+        -------
+        EntityEdge
+            The entity edge.
+
+        Raises
+        ------
+        EdgeNotFoundError
+            If no edge with the given UUID exists.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+        return await EntityEdge.get_by_uuid(driver, uuid)
+
+    async def update_edge(
+        self,
+        uuid: str,
+        name: str | None = None,
+        fact: str | None = None,
+        valid_at: datetime | None = None,
+        invalid_at: datetime | None = None,
+        attributes: dict | None = None,
+        group_id: str | None = None,
+    ) -> EntityEdge:
+        """
+        Update an existing entity edge. Regenerates embedding when fact changes.
+
+        Parameters
+        ----------
+        uuid : str
+            The UUID of the edge to update.
+        name : str | None, optional
+            New name for the edge.
+        fact : str | None, optional
+            New fact statement. Triggers embedding regeneration.
+        valid_at : datetime | None, optional
+            New valid_at timestamp.
+        invalid_at : datetime | None, optional
+            New invalid_at timestamp.
+        attributes : dict | None, optional
+            Attributes to merge into existing attributes.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+
+        Returns
+        -------
+        EntityEdge
+            The updated entity edge.
+
+        Raises
+        ------
+        EdgeNotFoundError
+            If no edge with the given UUID exists.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+
+        edge = await EntityEdge.get_by_uuid(driver, uuid)
+
+        if name is not None:
+            edge.name = name
+
+        if fact is not None and fact != edge.fact:
+            edge.fact = fact
+            await edge.generate_embedding(self.embedder)
+
+        if valid_at is not None:
+            edge.valid_at = valid_at
+
+        if invalid_at is not None:
+            edge.invalid_at = invalid_at
+
+        if attributes is not None:
+            edge.attributes.update(attributes)
+
+        await edge.save(driver)
+        return edge
+
+    async def remove_edge(self, uuid: str, group_id: str | None = None) -> None:
+        """
+        Remove an entity edge by UUID.
+
+        Parameters
+        ----------
+        uuid : str
+            The UUID of the edge to remove.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+
+        Raises
+        ------
+        EdgeNotFoundError
+            If no edge with the given UUID exists.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+        edge = await EntityEdge.get_by_uuid(driver, uuid)
+        await edge.delete(driver)
+
+    async def get_episode(self, uuid: str, group_id: str | None = None) -> EpisodicNode:
+        """
+        Retrieve an episode by UUID.
+
+        Parameters
+        ----------
+        uuid : str
+            The UUID of the episode to retrieve.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+
+        Returns
+        -------
+        EpisodicNode
+            The episodic node.
+
+        Raises
+        ------
+        NodeNotFoundError
+            If no episode with the given UUID exists.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+        return await EpisodicNode.get_by_uuid(driver, uuid)
+
+    async def get_entities_by_group_id(
+        self,
+        group_id: str,
+        limit: int | None = None,
+        uuid_cursor: str | None = None,
+    ) -> list[EntityNode]:
+        """
+        Retrieve entity nodes by group ID with pagination support.
+
+        Parameters
+        ----------
+        group_id : str
+            The group ID to filter by.
+        limit : int | None, optional
+            Maximum number of entities to return.
+        uuid_cursor : str | None, optional
+            UUID cursor for pagination.
+
+        Returns
+        -------
+        list[EntityNode]
+            List of entity nodes.
+        """
+        # FalkorDB uses separate graphs per group_id, so clone driver to point to correct graph
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB:
+            driver = driver.clone(database=group_id)
+
+        return await EntityNode.get_by_group_ids(
+            driver, [group_id], limit=limit, uuid_cursor=uuid_cursor
+        )
+
+    async def get_edges_by_group_id(
+        self,
+        group_id: str,
+        limit: int | None = None,
+        uuid_cursor: str | None = None,
+    ) -> list[EntityEdge]:
+        """
+        Retrieve entity edges by group ID with pagination support.
+
+        Parameters
+        ----------
+        group_id : str
+            The group ID to filter by.
+        limit : int | None, optional
+            Maximum number of edges to return.
+        uuid_cursor : str | None, optional
+            UUID cursor for pagination.
+
+        Returns
+        -------
+        list[EntityEdge]
+            List of entity edges. Returns empty list if no edges found.
+        """
+        # FalkorDB uses separate graphs per group_id, so clone driver to point to correct graph
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB:
+            driver = driver.clone(database=group_id)
+
+        return await EntityEdge.get_by_group_ids(
+            driver, [group_id], limit=limit, uuid_cursor=uuid_cursor
+        )
+
+    async def get_episodes_by_group_id(
+        self,
+        group_id: str,
+        limit: int | None = None,
+        uuid_cursor: str | None = None,
+    ) -> list[EpisodicNode]:
+        """
+        Retrieve episodes by group ID with pagination support.
+
+        Parameters
+        ----------
+        group_id : str
+            The group ID to filter by.
+        limit : int | None, optional
+            Maximum number of episodes to return.
+        uuid_cursor : str | None, optional
+            UUID cursor for pagination.
+
+        Returns
+        -------
+        list[EpisodicNode]
+            List of episodic nodes.
+        """
+        # FalkorDB uses separate graphs per group_id, so clone driver to point to correct graph
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB:
+            driver = driver.clone(database=group_id)
+
+        return await EpisodicNode.get_by_group_ids(
+            driver, [group_id], limit=limit, uuid_cursor=uuid_cursor
+        )
+
+    async def get_groups(self) -> list[str]:
+        """
+        Retrieve all available groups/databases.
+
+        For Neo4j: Returns distinct group_ids from nodes.
+        For FalkorDB: Returns all graph names (each group is a separate graph).
+
+        Returns
+        -------
+        list[str]
+            List of group/database names.
+        """
+        return await self.driver.list_groups()
+
+    async def remove_group(self, group_id: str) -> None:
+        """
+        Remove all nodes and edges belonging to a group.
+
+        WARNING: This is a destructive operation that cannot be undone.
+
+        For FalkorDB: Deletes the entire Redis graph key.
+        For Neo4j/Kuzu/Neptune: Deletes all nodes/edges with this group_id.
+
+        Parameters
+        ----------
+        group_id : str
+            The group ID to remove.
+        """
+        await self.driver.delete_group(group_id)
+
+    async def rename_group(self, old_group_id: str, new_group_id: str) -> None:
+        """
+        Rename a group to a new name.
+
+        WARNING: This is a destructive operation - the old group will no longer exist.
+
+        Parameters
+        ----------
+        old_group_id : str
+            The current group ID.
+        new_group_id : str
+            The new group ID.
+        """
+        await self.driver.rename_group(old_group_id, new_group_id)
+
+    async def get_graph_stats(self, group_id: str | None = None) -> dict:
+        """
+        Get statistics about the graph (node, edge, episode counts).
+
+        Parameters
+        ----------
+        group_id : str | None, optional
+            Filter by group ID. If None, counts all.
+
+        Returns
+        -------
+        dict
+            Dictionary with node_count, edge_count, episode_count, episode_edge_count.
+        """
+        # FalkorDB uses separate graphs per group_id, so clone driver to point to correct graph
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+
+        group_filter = 'WHERE n.group_id = $group_id' if group_id else ''
+        edge_group_filter = 'WHERE r.group_id = $group_id' if group_id else ''
+
+        params = {}
+        if group_id:
+            params['group_id'] = group_id
+
+        # Count entity nodes
+        node_result, _, _ = await driver.execute_query(
+            f'MATCH (n:Entity) {group_filter} RETURN count(n) AS count',
+            **params,
+        )
+        node_count = node_result[0]['count'] if node_result else 0
+
+        # Count edges (Kuzu uses RelatesToNode_ as intermediate nodes instead of direct relationships)
+        if driver.provider == GraphProvider.KUZU:
+            edge_result, _, _ = await driver.execute_query(
+                f'MATCH (n:RelatesToNode_) {group_filter} RETURN count(n) AS count',
+                **params,
+            )
+        else:
+            edge_result, _, _ = await driver.execute_query(
+                f'MATCH ()-[r:RELATES_TO]->() {edge_group_filter} RETURN count(r) AS count',
+                **params,
+            )
+        edge_count = edge_result[0]['count'] if edge_result else 0
+
+        # Count episodes
+        episode_result, _, _ = await driver.execute_query(
+            f'MATCH (n:Episodic) {group_filter} RETURN count(n) AS count',
+            **params,
+        )
+        episode_count = episode_result[0]['count'] if episode_result else 0
+
+        # Count edge-episode references
+        if driver.provider == GraphProvider.KUZU:
+            episode_edge_base = 'n.episodes IS NOT NULL AND size(n.episodes) > 0'
+            episode_edge_filter = (
+                f'WHERE n.group_id = $group_id AND {episode_edge_base}' if group_id
+                else f'WHERE {episode_edge_base}'
+            )
+            episode_edge_result, _, _ = await driver.execute_query(
+                f"""
+                MATCH (n:RelatesToNode_)
+                {episode_edge_filter}
+                RETURN sum(size(n.episodes)) AS count
+                """,
+                **params,
+            )
+        else:
+            episode_edge_base = 'r.episodes IS NOT NULL AND size(r.episodes) > 0'
+            episode_edge_filter = (
+                f'WHERE r.group_id = $group_id AND {episode_edge_base}' if group_id
+                else f'WHERE {episode_edge_base}'
+            )
+            episode_edge_result, _, _ = await driver.execute_query(
+                f"""
+                MATCH ()-[r:RELATES_TO]->()
+                {episode_edge_filter}
+                RETURN sum(size(r.episodes)) AS count
+                """,
+                **params,
+            )
+        episode_edge_count = episode_edge_result[0]['count'] if episode_edge_result else 0
+
+        return {
+            'node_count': node_count,
+            'edge_count': edge_count,
+            'episode_count': episode_count,
+            'episode_edge_count': episode_edge_count or 0,
+        }
+
+    async def execute_query(
+        self, query: str, group_id: str | None = None, **params
+    ) -> tuple[list[dict], list[str], dict]:
+        """
+        Execute a raw Cypher query against the graph.
+
+        This is a pass-through to the driver for advanced use cases.
+        WARNING: Do not expose this method to untrusted input. Cypher injection
+        is possible if the query string is built from user-controlled data.
+        Always use parameterized queries ($param syntax).
+
+        Parameters
+        ----------
+        query : str
+            The Cypher query to execute.
+        group_id : str | None, optional
+            The group ID for FalkorDB graph selection. Required for FalkorDB.
+        **params
+            Query parameters.
+
+        Returns
+        -------
+        tuple[list[dict], list[str], dict]
+            Records, column names, and metadata.
+        """
+        driver = self.driver
+        if driver.provider == GraphProvider.FALKORDB and group_id:
+            driver = driver.clone(database=group_id)
+        # Pass group_id to query params as well if provided (for queries using $group_id)
+        if group_id:
+            params['group_id'] = group_id
+        return await driver.execute_query(query, **params)
