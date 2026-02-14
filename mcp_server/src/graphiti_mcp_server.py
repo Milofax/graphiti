@@ -935,9 +935,20 @@ async def initialize_server() -> ServerConfig:
     graphiti_service = GraphitiService(config, SEMAPHORE_LIMIT)
 
     # Get Redis URL from FalkorDB config for the queue service
+    # Build URL with password if present (FalkorDBProviderConfig has uri + password separately)
+    # Note: FalkorDB/Redis uses password-only auth (no username), syntax: redis://:password@host:port
     redis_url = 'redis://localhost:6379'  # default
     if config.database.provider == 'falkordb' and config.database.providers.falkordb:
-        redis_url = config.database.providers.falkordb.uri
+        falkor_cfg = config.database.providers.falkordb
+        from urllib.parse import urlparse
+        parsed = urlparse(falkor_cfg.uri)
+        # Only add password if not already in URI and password is configured
+        if falkor_cfg.password and not parsed.password:
+            host = parsed.hostname or 'localhost'
+            port = parsed.port or 6379
+            redis_url = f'redis://:{falkor_cfg.password}@{host}:{port}'
+        else:
+            redis_url = falkor_cfg.uri
 
     queue_config = QueueConfig(redis_url=redis_url)
     queue_service = QueueService(config=queue_config)
