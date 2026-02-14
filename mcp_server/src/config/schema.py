@@ -265,6 +265,39 @@ class RerankerConfig(BaseModel):
     providers: EmbedderProvidersConfig = Field(default_factory=EmbedderProvidersConfig)
 
 
+class QueueConfigModel(BaseModel):
+    """Queue backend configuration."""
+
+    backend: str = Field(
+        default='auto',
+        description='Queue backend: "auto" (default), "redis", or "memory"',
+    )
+    redis_url: str | None = Field(
+        default=None,
+        description='Redis URL for Redis Streams backend (optional, auto-detected from FalkorDB if not set)',
+    )
+    consumer_group: str = Field(
+        default='graphiti_workers',
+        description='Redis consumer group name',
+    )
+    block_ms: int = Field(
+        default=5000,
+        description='Redis XREADGROUP blocking timeout in milliseconds',
+    )
+    claim_min_idle_ms: int = Field(
+        default=60000,
+        description='Minimum idle time before reclaiming abandoned messages',
+    )
+    max_retries: int = Field(
+        default=3,
+        description='Maximum retry attempts for failed messages',
+    )
+    shutdown_timeout: float = Field(
+        default=30.0,
+        description='Graceful shutdown timeout in seconds',
+    )
+
+
 class GraphitiAppConfig(BaseModel):
     """Graphiti-specific configuration."""
 
@@ -288,6 +321,7 @@ class GraphitiConfig(BaseSettings):
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     graphiti: GraphitiAppConfig = Field(default_factory=GraphitiAppConfig)
+    queue: QueueConfigModel = Field(default_factory=QueueConfigModel)
 
     # Additional server options
     destroy_graph: bool = Field(default=False, description='Clear graph on startup')
