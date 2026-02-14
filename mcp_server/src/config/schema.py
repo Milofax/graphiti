@@ -83,6 +83,12 @@ class ServerConfig(BaseModel):
     host: str = Field(default='0.0.0.0', description='Server host')
     port: int = Field(default=8000, description='Server port')
 
+    # Data directory for persistent storage (entity_types.json)
+    data_dir: str = Field(
+        default='/app/data',
+        description='Directory for persistent data storage (e.g., entity_types.json)',
+    )
+
     # Transport security settings (for HTTP transport)
     allowed_hosts: list[str] | None = Field(
         default=None,
@@ -231,11 +237,24 @@ class DatabaseConfig(BaseModel):
     providers: DatabaseProvidersConfig = Field(default_factory=DatabaseProvidersConfig)
 
 
+class EntityTypeFieldConfig(BaseModel):
+    """Entity type field configuration for structured attribute extraction."""
+
+    name: str = Field(..., description='Field name (must be valid Python identifier)')
+    type: str = Field(default='str', description='Field type: str, int, float, bool')
+    required: bool = Field(default=False, description='Whether the field is required')
+    description: str = Field(default='', description='Field description for LLM extraction')
+
+
 class EntityTypeConfig(BaseModel):
-    """Entity type configuration."""
+    """Entity type configuration with optional structured fields."""
 
     name: str
     description: str
+    fields: list[EntityTypeFieldConfig] = Field(
+        default_factory=list,
+        description='Optional list of structured fields for attribute extraction',
+    )
 
 
 class RerankerConfig(BaseModel):

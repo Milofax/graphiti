@@ -1,77 +1,66 @@
 # Graphiti MCP Server Configuration for Docker with FalkorDB
 # This configuration is optimized for running with docker-compose-falkordb.yml
-#
-# Environment variable expansion: ${VAR_NAME} or ${VAR_NAME:default_value}
-#
-# IMPORTANT: Set SEMAPHORE_LIMIT environment variable to control episode processing concurrency
-# Default: 10 (suitable for OpenAI Tier 3, mid-tier Anthropic)
-# See README.md "Concurrency and LLM Provider 429 Rate Limit Errors" section for tuning guidance
 
 server:
-  transport: "http"  # Options: stdio, sse (deprecated), http
+  transport: "http"  # HTTP transport (SSE is deprecated)
   host: "0.0.0.0"
   port: 8000
-
+  
 llm:
   provider: "openai"  # Options: openai, azure_openai, anthropic, gemini, groq
-  model: ${LLM_MODEL:gpt-4o-mini}
-  small_model: ${LLM_SMALL_MODEL:}  # Optional: Model for lightweight tasks (defaults to main model)
-                                     # For Ollama/local LLMs: set to same as main model
-  is_reasoning: ${LLM_IS_REASONING:}  # Optional: Set true for reasoning models
-                                       # Auto-detected for gpt-5/o1/o3 if not set
-  small_is_reasoning: ${LLM_SMALL_IS_REASONING:}  # Optional: Set true if small model is a reasoning model
+  model: "gpt-4o-mini"
   max_tokens: 4096
-
+  
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
       api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
       organization_id: ${OPENAI_ORGANIZATION_ID:}
-
+      
     azure_openai:
       api_key: ${AZURE_OPENAI_API_KEY}
       api_url: ${AZURE_OPENAI_ENDPOINT}
       api_version: ${AZURE_OPENAI_API_VERSION:2024-10-21}
       deployment_name: ${AZURE_OPENAI_DEPLOYMENT}
       use_azure_ad: ${USE_AZURE_AD:false}
-
+      
     anthropic:
       api_key: ${ANTHROPIC_API_KEY}
       api_url: ${ANTHROPIC_API_URL:https://api.anthropic.com}
       max_retries: 3
-
+      
     gemini:
       api_key: ${GOOGLE_API_KEY}
       project_id: ${GOOGLE_PROJECT_ID:}
       location: ${GOOGLE_LOCATION:us-central1}
-
+      
     groq:
       api_key: ${GROQ_API_KEY}
       api_url: ${GROQ_API_URL:https://api.groq.com/openai/v1}
 
 embedder:
   provider: "openai"  # Options: openai, azure_openai, gemini, voyage
-  model: ${EMBEDDING_MODEL:text-embedding-3-small}
-  dimensions: ${EMBEDDING_DIM:1536}
-
+  model: "text-embedding-3-small"
+  dimensions: 1536
+  
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
       api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
       organization_id: ${OPENAI_ORGANIZATION_ID:}
-
+      
     azure_openai:
       api_key: ${AZURE_OPENAI_API_KEY}
       api_url: ${AZURE_OPENAI_EMBEDDINGS_ENDPOINT}
       api_version: ${AZURE_OPENAI_API_VERSION:2024-10-21}
       deployment_name: ${AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}
       use_azure_ad: ${USE_AZURE_AD:false}
-
+      
     gemini:
       api_key: ${GOOGLE_API_KEY}
       project_id: ${GOOGLE_PROJECT_ID:}
       location: ${GOOGLE_LOCATION:us-central1}
-
+      
     voyage:
       api_key: ${VOYAGE_API_KEY}
       api_url: ${VOYAGE_API_URL:https://api.voyageai.com/v1}
@@ -87,26 +76,644 @@ database:
       password: ${FALKORDB_PASSWORD:}
       database: ${FALKORDB_DATABASE:default_db}
 
+# Queue backend configuration (auto-detects Redis from FalkorDB)
+queue:
+  backend: ${QUEUE_BACKEND:auto}
+
 graphiti:
   group_id: ${GRAPHITI_GROUP_ID:main}
   episode_id_prefix: ${EPISODE_ID_PREFIX:}
   user_id: ${USER_ID:mcp_user}
+  # Entity types based on Schema.org, IEEE 830, and Dublin Core standards
+  #
+  # DESIGN PRINCIPLES:
+  # - Fields = Intrinsic scalar values (dates, numbers, enums, identifiers, contact info)
+  # - Edges = Relationships to other entities (extracted automatically by LLM)
+  #   Example: Person→Organization is an EDGE, not a field "affiliation"
+  #
+  # DO NOT add fields for relationships - the LLM creates edges automatically:
+  #   ✗ Person.affiliation (wrong - should be edge Person→Organization)
+  #   ✗ Organization.location (wrong - should be edge Organization→Location)
+  #   ✓ Person.birth_date (correct - scalar value)
+  #   ✓ Person.email (correct - contact identifier)
+  #
   entity_types:
-    - name: "Preference"
-      description: "User preferences, choices, opinions, or selections (PRIORITIZE over most other types except User/Assistant)"
-    - name: "Requirement"
-      description: "Specific needs, features, or functionality that must be fulfilled"
-    - name: "Procedure"
-      description: "Standard operating procedures and sequential instructions"
-    - name: "Location"
-      description: "Physical or virtual places where activities occur"
-    - name: "Event"
-      description: "Time-bound activities, occurrences, or experiences"
+    # === Project Management ===
+    - name: "Project"
+      description: "Software, research, or business project - the top-level container. Edges: →Person (owner, lead, team_member), →Organization (client, contractor, sponsor), →Technology (uses), →Component (contains), →Requirement (has), →Document (has), →Domain (field_of)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: software, research, business, infrastructure"
+        - name: "status"
+          type: "str"
+          required: false
+          description: "Status: planning, active, on_hold, completed, cancelled"
+        - name: "start_date"
+          type: "str"
+          required: false
+          description: "Project start (YYYY-MM-DD)"
+        - name: "end_date"
+          type: "str"
+          required: false
+          description: "Project end/deadline (YYYY-MM-DD)"
+
+    # === Core Personal/Organizational Entities (Schema.org) ===
+    - name: "Person"
+      description: "A human individual - user, contact, author, participant, or any named person. Edges: →Organization (employer, member_of), →Person (spouse, parent, child, sibling, friend, colleague), →Location (residence, birthplace, workplace), →Event (attends, organizes), →Project (leads, works_on), →Component (develops), →ArchitectureDecision (decided)."
+      fields:
+        - name: "gender"
+          type: "str"
+          required: false
+          description: "Gender: male, female, other, unknown"
+        - name: "title"
+          type: "str"
+          required: false
+          description: "Academic/professional title: Dr., Prof., Dipl.-Ing., etc."
+        - name: "first_name"
+          type: "str"
+          required: false
+          description: "First/given name (Rufname)"
+        - name: "middle_names"
+          type: "str"
+          required: false
+          description: "Middle names (comma-separated if multiple)"
+        - name: "last_name"
+          type: "str"
+          required: false
+          description: "Last/family name"
+        - name: "phone"
+          type: "str"
+          required: false
+          description: "Phone number (landline)"
+        - name: "mobile"
+          type: "str"
+          required: false
+          description: "Mobile phone number"
+        - name: "email"
+          type: "str"
+          required: false
+          description: "Email address"
+        - name: "birth_date"
+          type: "str"
+          required: false
+          description: "Date of birth (YYYY-MM-DD)"
+        - name: "nationality"
+          type: "str"
+          required: false
+          description: "Nationality (ISO 3166-1 country code)"
+        - name: "job_title"
+          type: "str"
+          required: false
+          description: "Current job title or profession"
+
     - name: "Organization"
-      description: "Companies, institutions, groups, or formal entities"
+      description: "Company, institution, team, group, or any formal entity. Edges: →Location (headquarters, branch, office), →Person (founder, ceo, employee, member), →Organization (parent_company, subsidiary, partner), →NetworkEndpoint (website, api), →Project (owns, sponsors, executes)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: company, nonprofit, government, team, department, university"
+        - name: "industry"
+          type: "str"
+          required: false
+          description: "Industry sector"
+        - name: "founded_date"
+          type: "str"
+          required: false
+          description: "Founding date (YYYY-MM-DD)"
+        - name: "tax_id"
+          type: "str"
+          required: false
+          description: "Tax ID, VAT number, or registration number"
+
+    # === Spatial/Temporal Entities (Schema.org) ===
+    - name: "Location"
+      description: "Physical place or geographic area. Virtual/network locations use NetworkEndpoint instead. Edges: →Location (part_of, near - e.g., city→country)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: address, city, region, country, building, room, area"
+        - name: "address"
+          type: "str"
+          required: false
+          description: "Full street address"
+        - name: "postal_code"
+          type: "str"
+          required: false
+          description: "Postal/ZIP code"
+        - name: "city"
+          type: "str"
+          required: false
+          description: "City or locality name"
+        - name: "country"
+          type: "str"
+          required: false
+          description: "Country (ISO 3166-1 code)"
+        - name: "coordinates"
+          type: "str"
+          required: false
+          description: "GPS coordinates (lat,lon)"
+
+    - name: "Event"
+      description: "Time-bound occurrence, activity, or meeting. Edges: →Person (organizer, participant, speaker), →Location (venue), →Organization (host, sponsor), →NetworkEndpoint (meeting_link, registration_url), →Event (part_of, follows), →Project (milestone_of, belongs_to)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: meeting, conference, deadline, milestone, incident, birthday, holiday"
+        - name: "status"
+          type: "str"
+          required: false
+          description: "Status: scheduled, in_progress, completed, cancelled"
+        - name: "start_date"
+          type: "str"
+          required: false
+          description: "Start date/time (YYYY-MM-DD or YYYY-MM-DDTHH:MM)"
+        - name: "end_date"
+          type: "str"
+          required: false
+          description: "End date/time (YYYY-MM-DD or YYYY-MM-DDTHH:MM)"
+        - name: "recurrence"
+          type: "str"
+          required: false
+          description: "Recurrence: once, daily, weekly, monthly, yearly"
+
+    # === User Preference/Behavior Entities ===
+    - name: "Preference"
+      description: "User choice, opinion, setting, or selection - PRIORITIZE for personal preferences. Edges: →Person (held_by), →Topic (about), →Technology (prefers)."
+      fields:
+        - name: "category"
+          type: "str"
+          required: false
+          description: "Category: ui, workflow, communication, technical, food, lifestyle"
+        - name: "value"
+          type: "str"
+          required: false
+          description: "The preferred value or choice"
+        - name: "strength"
+          type: "str"
+          required: false
+          description: "Strength: must, prefer, like, dislike, avoid, never"
+
+    # === Requirements & Business Analysis (IEEE 830 / ISO 29148) ===
+    - name: "Requirement"
+      description: "Functional or non-functional requirement, feature request, or specification. Edges: →Person (requested_by, assigned_to), →Organization (stakeholder), →Technology (requires, implements), →Requirement (depends_on, conflicts_with), →Project (belongs_to), →UseCase (satisfied_by), →Component (implemented_by)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: functional, performance, security, usability, constraint"
+        - name: "priority"
+          type: "str"
+          required: false
+          description: "MoSCoW: must_have, should_have, could_have, wont_have"
+        - name: "status"
+          type: "str"
+          required: false
+          description: "Status: draft, proposed, approved, implemented, verified, rejected"
+        - name: "acceptance_criteria"
+          type: "str"
+          required: false
+          description: "Testable conditions for satisfaction"
+        - name: "version"
+          type: "str"
+          required: false
+          description: "Version number (semver)"
+
+    - name: "UseCase"
+      description: "User interaction scenario with system - fachlicher Anwendungsfall. Edges: →Person (actor), →UseCase (extends, includes), →Requirement (satisfies), →Component (implemented_by), →Project (belongs_to), →Rule (constrained_by)."
+      fields:
+        - name: "actor"
+          type: "str"
+          required: false
+          description: "Primary actor (role name)"
+        - name: "precondition"
+          type: "str"
+          required: false
+          description: "Required state before execution"
+        - name: "postcondition"
+          type: "str"
+          required: false
+          description: "Guaranteed state after success"
+        - name: "main_flow"
+          type: "str"
+          required: false
+          description: "Main success scenario (numbered steps)"
+        - name: "priority"
+          type: "str"
+          required: false
+          description: "Priority: critical, high, medium, low"
+        - name: "status"
+          type: "str"
+          required: false
+          description: "Status: draft, approved, implemented, tested"
+
+    - name: "Rule"
+      description: "Constraint, policy, or decision logic (game rules, business rules, etc.). For complex logic, build a Condition tree: Rule→Condition(operator=and/or)→Condition(operator=leaf). Edges: →Condition (evaluates - root of condition tree), →Organization (enterprise_policy_of), →Project (applies_in), →Requirement (implements, derived_from), →Domain (belongs_to), →UseCase (enforced_in), →Component (enforced_by)."
+      fields:
+        - name: "statement"
+          type: "str"
+          required: false
+          description: "The rule statement or definition in natural language"
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: constraint, computation, inference, action_enabler, policy"
+        - name: "action"
+          type: "str"
+          required: false
+          description: "Action to execute when condition is met"
+        - name: "enforcement"
+          type: "str"
+          required: false
+          description: "Enforcement: manual, automatic, hybrid"
+        - name: "scope"
+          type: "str"
+          required: false
+          description: "Scope: enterprise, project, domain, process"
+
+    - name: "Condition"
+      description: "Logical condition for boolean expressions. Build complex logic via edges: requires_all (AND), requires_any (OR), negates (NOT). Leaf conditions have no children. Edges: →Condition (requires_all, requires_any, negates), →Rule (triggers, part_of), →Fact (evaluates), →Event (triggered_by)."
+      fields:
+        - name: "operator"
+          type: "str"
+          required: false
+          description: "Operator: and, or, not, leaf"
+        - name: "expression"
+          type: "str"
+          required: false
+          description: "Human-readable expression for documentation (e.g., 'A & (B | C)')"
+
+    # === Document/Content Entities (Dublin Core) ===
     - name: "Document"
-      description: "Information content in various forms (books, articles, reports, etc.)"
+      description: "Information resource: file, article, report, book. Edges: →Person (author, editor, reviewer), →Organization (publisher), →Topic (about), →Document (references, version_of), →NetworkEndpoint (url, download_link), →Project (belongs_to), →UseCase (documents), →Interface (documents), →ArchitectureDecision (documents), →DataModel (documents)."
+      fields:
+        - name: "title"
+          type: "str"
+          required: false
+          description: "Document title"
+        - name: "publication_date"
+          type: "str"
+          required: false
+          description: "Publication date (YYYY-MM-DD)"
+        - name: "format"
+          type: "str"
+          required: false
+          description: "Format: pdf, markdown, html, docx, txt, epub"
+        - name: "identifier"
+          type: "str"
+          required: false
+          description: "Unique ID: DOI, ISBN, file path"
+        - name: "language"
+          type: "str"
+          required: false
+          description: "Content language (ISO 639-1: en, de, fr)"
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: specification, manual, report, article, contract, email, adr"
+
+    # === Operational Entities ===
+    - name: "Procedure"
+      description: "Step-by-step process, workflow, or instruction set. Edges: →Person (responsible, executor), →Technology (uses), →Document (documented_in), →Procedure (sub_procedure, follows), →UseCase (implements), →Project (belongs_to)."
+      fields:
+        - name: "steps"
+          type: "str"
+          required: false
+          description: "Numbered steps or stages"
+        - name: "trigger"
+          type: "str"
+          required: false
+          description: "What initiates this procedure"
+        - name: "outcome"
+          type: "str"
+          required: false
+          description: "Expected result or output"
+        - name: "frequency"
+          type: "str"
+          required: false
+          description: "Frequency: once, daily, weekly, on_demand"
+
+    # === Architecture & Design Entities ===
+    - name: "ArchitectureDecision"
+      description: "Architecture Decision Record (ADR) - documents why a technical decision was made. Edges: →Technology (involves), →Component (affects), →ArchitectureDecision (supersedes), →Person (decided_by), →Project (belongs_to), →Document (documented_in)."
+      fields:
+        - name: "status"
+          type: "str"
+          required: false
+          description: "Status: proposed, accepted, deprecated, superseded"
+        - name: "context"
+          type: "str"
+          required: false
+          description: "Why this decision was needed"
+        - name: "decision"
+          type: "str"
+          required: false
+          description: "What was decided"
+        - name: "consequences"
+          type: "str"
+          required: false
+          description: "Positive and negative consequences"
+
+    - name: "Component"
+      description: "Software module, service, or package - a buildable/deployable unit. Edges: →Component (depends_on, contains), →Interface (exposes, consumes), →Technology (built_with), →Project (part_of), →Person (developed_by, maintained_by), →ArchitectureDecision (affected_by)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: service, module, library, microservice, package, class"
+        - name: "layer"
+          type: "str"
+          required: false
+          description: "Layer: presentation, business, data, infrastructure"
+        - name: "status"
+          type: "str"
+          required: false
+          description: "Status: planned, in_development, active, deprecated"
+
+    - name: "Interface"
+      description: "API contract or service boundary - collection of methods/endpoints. Edges: →Component (exposed_by, consumed_by), →Method (contains), →NetworkEndpoint (available_at), →Document (documented_in), →Technology (protocol)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: rest_api, graphql, grpc, class_interface, event_bus, message_queue"
+        - name: "version"
+          type: "str"
+          required: false
+          description: "API version (semver)"
+        - name: "auth"
+          type: "str"
+          required: false
+          description: "Auth: none, api_key, oauth2, jwt, basic"
+
+    - name: "Method"
+      description: "Function, method, or operation signature - single callable unit. Edges: →Component (belongs_to), →Interface (part_of), →DataModel (input, output), →Method (calls, overrides)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: sync, async, static, constructor, getter, setter"
+        - name: "signature"
+          type: "str"
+          required: false
+          description: "Full signature: 'getUser(id: Long): User'"
+        - name: "visibility"
+          type: "str"
+          required: false
+          description: "Visibility: public, private, protected, internal"
+        - name: "input_params"
+          type: "str"
+          required: false
+          description: "Input parameters (compact)"
+        - name: "return_type"
+          type: "str"
+          required: false
+          description: "Return type"
+
+    - name: "DataModel"
+      description: "Data structure, schema, or type definition. Edges: →Interface (used_by), →Component (owned_by), →DataModel (references, extends), →Technology (defined_in), →Document (documented_in)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: entity, dto, event, aggregate, value_object, enum"
+        - name: "format"
+          type: "str"
+          required: false
+          description: "Format: json_schema, typescript, pydantic, protobuf, sql"
+        - name: "schema"
+          type: "str"
+          required: false
+          description: "Schema definition (compact)"
+
+    # === Technical Entities ===
+    - name: "Technology"
+      description: "Software, tool, framework, language, or technical component. Edges: →Technology (depends_on, alternative_to, built_with), →Organization (developed_by, maintained_by), →NetworkEndpoint (repository, documentation, homepage), →Domain (belongs_to), →Component (used_in), →DataModel (defines), →Interface (implements)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: language, framework, database, service, tool, library"
+        - name: "version"
+          type: "str"
+          required: false
+          description: "Version number (semver)"
+        - name: "license"
+          type: "str"
+          required: false
+          description: "License: MIT, Apache-2.0, GPL-3.0, proprietary"
+
+    - name: "NetworkEndpoint"
+      description: "Network address, URL, API endpoint, or connection URI. A URL IS a NetworkEndpoint. Edges: →Organization (owned_by, hosted_by), →Technology (serves, runs), →Location (hosted_in - data center location), →Interface (serves), →Component (hosts)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: api, database, website, service, ssh, vpn, websocket"
+        - name: "protocol"
+          type: "str"
+          required: false
+          description: "Protocol: http, https, ssh, redis, postgresql, mongodb, mqtt, grpc"
+        - name: "host"
+          type: "str"
+          required: false
+          description: "Hostname, IP address, or domain"
+        - name: "port"
+          type: "str"
+          required: false
+          description: "Port number"
+        - name: "path"
+          type: "str"
+          required: false
+          description: "URL path or resource path"
+
+    # === Knowledge Organization Entities ===
+    - name: "Domain"
+      description: "Knowledge domain, field of expertise, or subject area (e.g., 'Software Engineering', 'Medicine', 'Cooking'). Edges: →Domain (parent_domain, related_to), →Project (field_of), →Term (contains)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: academic, professional, hobby, industry, science"
+
     - name: "Topic"
-      description: "Subject of conversation, interest, or knowledge domain (use as last resort)"
-    - name: "Object"
-      description: "Physical items, tools, devices, or possessions (use as last resort)"
+      description: "Specific subject or theme within a domain (e.g., 'Python', 'Heart Surgery', 'Italian Cuisine'). Edges: →Domain (belongs_to), →Topic (related_to, prerequisite_of), →Project (about), →Term (has_term)."
+      fields:
+        - name: "keywords"
+          type: "str"
+          required: false
+          description: "Related keywords (comma-separated)"
+
+    - name: "Term"
+      description: "Domain-specific term, concept, or glossary entry - Fachbegriff. Edges: →Domain (belongs_to), →Term (synonym_of, see_also), →Document (defined_in), →Concept (used_in)."
+      fields:
+        - name: "definition"
+          type: "str"
+          required: false
+          description: "Precise definition"
+        - name: "context"
+          type: "str"
+          required: false
+          description: "Context where this definition applies"
+        - name: "synonyms"
+          type: "str"
+          required: false
+          description: "Alternative names (comma-separated)"
+
+    - name: "Concept"
+      description: "Abstract idea, theory, model, or principle - from books, papers, or established knowledge. Edges: →Domain (belongs_to), →Topic (part_of), →Concept (builds_on, contradicts, extends), →Person (developed_by), →Document (described_in), →Term (uses), →Fact (supported_by)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: theory, model, principle, framework, paradigm, hypothesis, law"
+        - name: "status"
+          type: "str"
+          required: false
+          description: "Status: hypothesis, accepted, disputed, deprecated, superseded"
+        - name: "abstract"
+          type: "str"
+          required: false
+          description: "Brief abstract of the concept"
+
+    - name: "Fact"
+      description: "Asserted statement or claim from a source - verifiable information from books or research. Edges: →Document (source), →Concept (supports, contradicts), →Fact (derived_from, contradicts), →Person (stated_by), →Topic (about)."
+      fields:
+        - name: "confidence"
+          type: "str"
+          required: false
+          description: "Confidence: verified, likely, disputed, disproven"
+        - name: "evidence_type"
+          type: "str"
+          required: false
+          description: "Evidence: empirical, theoretical, anecdotal, statistical, citation"
+        - name: "value"
+          type: "str"
+          required: false
+          description: "The factual value if quantifiable (e.g., '299792458 m/s')"
+        - name: "source_page"
+          type: "str"
+          required: false
+          description: "Page number or location in source document"
+
+    # === Products & Items ===
+    - name: "Product"
+      description: "Anything manufactured, purchased, owned, or collected - physical objects (tools, vehicles, appliances, toys, game pieces, furniture), digital goods (software, media), or financial instruments (stocks, bonds, ETFs). If it has a brand, model, price, or can be bought/sold, use Product. Edges: →Organization (manufacturer, issuer, vendor), →Person (owner, reviewer), →Location (available_at), →Product (component_of, alternative_to, accessory_for), →Document (manual, review, specification)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: tool, vehicle, appliance, electronics, software, stock, option, bond, etf, crypto, service"
+        - name: "brand"
+          type: "str"
+          required: false
+          description: "Manufacturer, brand, or issuer"
+        - name: "model"
+          type: "str"
+          required: false
+          description: "Model name or number"
+        - name: "identifier"
+          type: "str"
+          required: false
+          description: "Unique ID: SKU, ticker, ISIN, VIN"
+        - name: "serial_number"
+          type: "str"
+          required: false
+          description: "Serial number of owned instance"
+        - name: "version"
+          type: "str"
+          required: false
+          description: "Version, year, or revision"
+        - name: "price"
+          type: "str"
+          required: false
+          description: "Price or price range with currency"
+
+    - name: "Animal"
+      description: "Living creature - pet, wild animal, livestock, or animal species (cats, dogs, horses, birds, fish, etc.). Use for both specific pets and general species. Edges: →Person (owner, caretaker), →Organization (owned_by, shelter, zoo), →Location (habitat, lives_at), →Product (food, toy, accessory)."
+      fields:
+        - name: "species"
+          type: "str"
+          required: false
+          description: "Species: cat, dog, horse, bird, fish, cow, pig, etc."
+        - name: "breed"
+          type: "str"
+          required: false
+          description: "Breed if applicable (e.g., 'Maine Coon', 'Labrador')"
+        - name: "pet_name"
+          type: "str"
+          required: false
+          description: "Individual pet name if owned (e.g., 'Whiskers', 'Bello')"
+
+    - name: "Item"
+      description: "Generic object that is NOT a product - use ONLY for things without brand/model like heirlooms, found objects, handmade items, or unidentifiable objects (e.g., 'Grandma's ring', 'flea market find', 'handmade shelf'). For products with brand/model use Product instead. Edges: →Person (owned_by, found_by, made_by), →Location (found_at, located_at)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Category: heirloom, handmade, found_object, antique, artifact, unknown"
+
+    # === Activities, Strategies & Roles ===
+    - name: "Activity"
+      description: "Practice, sport, hobby, or activity - something you DO regularly or as a skill (Sales Call, Code Review, Trading, Negotiation, Presentation). Edges: →Product (requires_equipment), →Person (practiced_by), →Strategy (uses), →Activity (related_to, prerequisite_for), →Domain (belongs_to), →Role (performed_by)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: sport, hobby, practice, exercise, game, craft, business_activity"
+        - name: "difficulty"
+          type: "str"
+          required: false
+          description: "Difficulty: beginner, intermediate, advanced, expert"
+        - name: "frequency"
+          type: "str"
+          required: false
+          description: "Frequency: daily, weekly, monthly, occasional, on_demand"
+        - name: "duration"
+          type: "str"
+          required: false
+          description: "Typical duration (e.g., '30min', '2h', '1 day')"
+
+    - name: "Strategy"
+      description: "Method, approach, tactic, or technique to achieve a goal (Covered Call, Cold Calling, A/B Testing, Agile, Cost Leadership). Edges: →Activity (used_in), →Product (involves), →Strategy (alternative_to, builds_on), →Concept (based_on), →Domain (belongs_to), →Goal (achieves)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: trading, sales, marketing, management, optimization, risk_management"
+        - name: "complexity"
+          type: "str"
+          required: false
+          description: "Complexity: simple, moderate, complex, advanced"
+        - name: "risk_profile"
+          type: "str"
+          required: false
+          description: "Risk: conservative, moderate, aggressive"
+        - name: "time_horizon"
+          type: "str"
+          required: false
+          description: "Time horizon: short_term, medium_term, long_term"
+
+    - name: "Role"
+      description: "Function or part someone plays in a specific context (Account Manager, Scrum Master, Investor, Stakeholder, Team Lead). Edges: →Person (played_by), →Activity (performs), →Organization (within), →Role (reports_to, collaborates_with), →Requirement (responsible_for)."
+      fields:
+        - name: "type"
+          type: "str"
+          required: false
+          description: "Type: professional, organizational, project, social, hierarchical"
+        - name: "context"
+          type: "str"
+          required: false
+          description: "Context where this role applies"
+        - name: "responsibilities"
+          type: "str"
+          required: false
+          description: "Key responsibilities (comma-separated)"
+        - name: "authority_level"
+          type: "str"
+          required: false
+          description: "Authority: executive, manager, lead, contributor, observer"
