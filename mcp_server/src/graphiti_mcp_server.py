@@ -37,7 +37,7 @@ from models.response_types import (
 )
 from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
 from services.entity_type_service import EntityTypeService
-from services.queue_service import QueueConfig, QueueService
+from services.queue_service import QueueBackend, create_queue_backend
 from utils.formatting import format_fact_result
 
 # Load .env file from mcp_server directory
@@ -175,7 +175,7 @@ mcp = FastMCP(
 
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
-queue_service: QueueService | None = None
+queue_service: QueueBackend | None = None
 entity_type_service: EntityTypeService | None = None
 
 # Global client for backward compatibility
@@ -1519,6 +1519,42 @@ async def http_get_stats(request) -> JSONResponse:
         return JSONResponse({'error': 'Internal server error'}, status_code=500)
 
 
+@mcp.custom_route('/queue/status', methods=['GET'])
+async def queue_status(request) -> JSONResponse:
+    """Get queue processing status for UI polling.
+
+    Returns:
+        - total_pending: Total messages waiting across all groups
+        - currently_processing: Number of active workers
+        - groups: Per-group breakdown (optional, if group_id param provided)
+    """
+    global queue_service
+
+    if queue_service is None:
+        return JSONResponse({
+            'total_pending': 0,
+            'currently_processing': 0,
+            'error': 'Queue service not initialized',
+        })
+
+    try:
+        total_pending, currently_processing, groups = await queue_service.get_status()
+        result = {
+            'total_pending': total_pending,
+            'currently_processing': currently_processing,
+        }
+        if groups:
+            result['groups'] = groups
+        return JSONResponse(result)
+    except Exception as e:
+        logger.error(f'Error getting queue status: {e}')
+        return JSONResponse({
+            'total_pending': 0,
+            'currently_processing': 0,
+            'error': 'Internal server error',
+        })
+
+
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
     global config, graphiti_service, queue_service, entity_type_service, graphiti_client, semaphore
@@ -1653,33 +1689,19 @@ async def initialize_server() -> ServerConfig:
     # Initialize services
     graphiti_service = GraphitiService(config, SEMAPHORE_LIMIT, entity_type_service)
 
-    # Get Redis URL from FalkorDB config for the queue service
-    # Build URL with password if present (FalkorDBProviderConfig has uri + password separately)
-    # Note: FalkorDB/Redis uses password-only auth (no username), syntax: redis://:password@host:port
-    redis_url = 'redis://localhost:6379'  # default
-    if config.database.provider == 'falkordb' and config.database.providers.falkordb:
-        falkor_cfg = config.database.providers.falkordb
-        from urllib.parse import urlparse
-        parsed = urlparse(falkor_cfg.uri)
-        # Only add password if not already in URI and password is configured
-        if falkor_cfg.password and not parsed.password:
-            host = parsed.hostname or 'localhost'
-            port = parsed.port or 6379
-            redis_url = f'redis://:{falkor_cfg.password}@{host}:{port}'
-        else:
-            redis_url = falkor_cfg.uri
-
-    queue_config = QueueConfig(redis_url=redis_url)
-    queue_service = QueueService(config=queue_config)
-
+    # Create queue backend using factory (auto-detects Redis from FalkorDB or uses In-Memory)
+    queue_service = create_queue_backend(config)
     await graphiti_service.initialize()
 
     # Set global client for backward compatibility
     graphiti_client = await graphiti_service.get_client()
     semaphore = graphiti_service.semaphore
 
-    # Initialize queue service with the client
-    await queue_service.initialize(graphiti_client)
+    # Initialize queue service with the client and entity types
+    await queue_service.initialize(
+        graphiti_client,
+        entity_types=graphiti_service.entity_types,
+    )
 
     # Set MCP server settings
     if config.server.host:
