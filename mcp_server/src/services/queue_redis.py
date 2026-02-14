@@ -11,7 +11,6 @@ Features:
 import asyncio
 import logging
 import os
-import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -98,8 +97,8 @@ class RedisStreamsBackend(QueueBackend):
         self._actively_processing: set[str] = set()
         self._shutting_down: bool = False
 
-        # Unique consumer name per instance
-        self._consumer_name = f'worker_{socket.gethostname()}_{os.getpid()}'
+        # Stable consumer name — survives container restarts (same PEL ownership)
+        self._consumer_name = os.environ.get('GRAPHITI_CONSUMER_NAME', 'worker_0')
 
     def _stream_key(self, group_id: str) -> str:
         """Get Redis Stream key for a group_id."""
@@ -275,6 +274,10 @@ class RedisStreamsBackend(QueueBackend):
                 if reclaim_counter >= RECLAIM_EVERY:
                     reclaim_counter = 0
                     await self._claim_abandoned(group_id)
+                    try:
+                        await self._redis.xtrim(stream_key, maxlen=100, approximate=True)
+                    except Exception:
+                        pass
 
                 # Phase 1: Check for pending (unacked) messages from previous failures
                 message_to_process = None
@@ -317,6 +320,33 @@ class RedisStreamsBackend(QueueBackend):
 
                 if message_to_process is None:
                     continue
+
+                # Enforce max_retries via Redis delivery count (PEL)
+                msg_id_check = message_to_process[0]
+                try:
+                    pending_info = await self._redis.xpending_range(
+                        stream_key, self._config.consumer_group,
+                        min=msg_id_check, max=msg_id_check, count=1,
+                    )
+                    if (
+                        pending_info
+                        and pending_info[0].get('times_delivered', 0) > self._config.max_retries
+                    ):
+                        logger.warning(
+                            f'Discarding {msg_id_check} after '
+                            f'{pending_info[0]["times_delivered"]} deliveries: '
+                            f'{message_to_process[1].get("name", "?")}'
+                        )
+                        await self._redis.xack(
+                            stream_key, self._config.consumer_group, msg_id_check
+                        )
+                        try:
+                            await self._redis.xdel(stream_key, msg_id_check)
+                        except Exception:
+                            pass
+                        continue
+                except Exception as e:
+                    logger.debug(f'Could not check delivery count for {msg_id_check}: {e}')
 
                 message_id, data = message_to_process
                 self._actively_processing.add(group_id)
@@ -373,6 +403,10 @@ class RedisStreamsBackend(QueueBackend):
             )
 
             await self._redis.xack(stream_key, self._config.consumer_group, message_id)
+            try:
+                await self._redis.xdel(stream_key, message_id)
+            except Exception:
+                pass  # Periodic XTRIM will clean up
             logger.info(f'Successfully processed episode {episode.uuid}')
             return True
 
