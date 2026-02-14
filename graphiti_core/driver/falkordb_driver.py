@@ -125,6 +125,7 @@ class FalkorDriver(GraphDriver):
         password: str | None = None,
         falkor_db: FalkorDB | None = None,
         database: str = 'default_db',
+        _skip_index_init: bool = False,
     ):
         """
         Initialize the FalkorDB driver.
@@ -140,6 +141,7 @@ class FalkorDriver(GraphDriver):
         password (str | None): The password for authentication (if required).
         falkor_db (FalkorDB | None): An existing FalkorDB instance to use instead of creating a new one.
         database (str): The name of the database to connect to. Defaults to 'default_db'.
+        _skip_index_init (bool): Internal flag to skip index initialization (used by clone()).
         """
         super().__init__()
         self._database = database
@@ -149,15 +151,16 @@ class FalkorDriver(GraphDriver):
         else:
             self.client = FalkorDB(host=host, port=port, username=username, password=password)
 
-        # Schedule the indices and constraints to be built
-        try:
-            # Try to get the current event loop
-            loop = asyncio.get_running_loop()
-            # Schedule the build_indices_and_constraints to run
-            loop.create_task(self.build_indices_and_constraints())
-        except RuntimeError:
-            # No event loop running, this will be handled later
-            pass
+        # Schedule the indices and constraints to be built (unless skipped for cloned drivers)
+        if not _skip_index_init:
+            try:
+                # Try to get the current event loop
+                loop = asyncio.get_running_loop()
+                # Schedule the build_indices_and_constraints to run
+                loop.create_task(self.build_indices_and_constraints())
+            except RuntimeError:
+                # No event loop running, this will be handled later
+                pass
 
     def _get_graph(self, graph_name: str | None) -> FalkorGraph:
         # FalkorDB requires a non-None database name for multi-tenant graphs; the default is "default_db"
@@ -253,14 +256,18 @@ class FalkorDriver(GraphDriver):
         """
         Returns a shallow copy of this driver with a different default database.
         Reuses the same connection (e.g. FalkorDB, Neo4j).
+
+        NOTE: _skip_index_init=True prevents auto-creation of graphs when cloning.
+        FalkorDB's select_graph() auto-creates non-existent graphs, which would
+        recreate a graph we're about to delete.
         """
         if database == self._database:
             cloned = self
         elif database == self.default_group_id:
-            cloned = FalkorDriver(falkor_db=self.client)
+            cloned = FalkorDriver(falkor_db=self.client, _skip_index_init=True)
         else:
             # Create a new instance of FalkorDriver with the same connection but a different database
-            cloned = FalkorDriver(falkor_db=self.client, database=database)
+            cloned = FalkorDriver(falkor_db=self.client, database=database, _skip_index_init=True)
 
         return cloned
 
@@ -354,3 +361,102 @@ class FalkorDriver(GraphDriver):
             return ''
 
         return sanitized_query
+
+    async def copy_group(self, source_group_id: str, target_group_id: str) -> None:
+        """
+        Copy a FalkorDB graph to a new name using GRAPH.COPY Redis command.
+
+        In FalkorDB, each group_id is a separate Redis graph key.
+        """
+        if source_group_id == target_group_id:
+            raise ValueError('Source and target group IDs must be different')
+
+        redis_conn = self.client.connection
+        await redis_conn.execute_command('GRAPH.COPY', source_group_id, target_group_id)
+        logger.info(f'Copied graph {source_group_id} to {target_group_id}')
+
+    async def rename_group(self, old_group_id: str, new_group_id: str) -> None:
+        """
+        Rename a FalkorDB graph by copying to new name and deleting the old one.
+
+        In FalkorDB, each group_id is a separate Redis graph key.
+        Uses GRAPH.COPY + GRAPH.DELETE since there's no GRAPH.RENAME command.
+        """
+        if old_group_id == new_group_id:
+            raise ValueError('Old and new group IDs must be different')
+
+        redis_conn = self.client.connection
+
+        # Copy to new name
+        await redis_conn.execute_command('GRAPH.COPY', old_group_id, new_group_id)
+        logger.info(f'Copied graph {old_group_id} to {new_group_id}')
+
+        # Delete old graph
+        try:
+            await redis_conn.execute_command('GRAPH.DELETE', old_group_id)
+            logger.info(f'Deleted old graph {old_group_id}')
+        except Exception as e:
+            logger.error(
+                f'Failed to delete old graph {old_group_id} after copying to '
+                f'{new_group_id}. Data exists in both. Manual cleanup required: {e}'
+            )
+            raise
+
+    async def list_groups(self) -> list[str]:
+        """
+        List all FalkorDB graphs (groups).
+
+        In FalkorDB, each group is stored as a separate Redis key of type 'graphdata'.
+        Returns all graph names excluding system/internal keys.
+
+        NOTE: Don't exclude self._database because it can change when processing
+        episodes for different groups (Graphiti.add_episode clones the driver).
+        """
+        # Excluded system/internal graphs (hardcoded, not based on current _database)
+        excluded_graphs = {'graphiti', 'default_db'}
+        logger.debug(f'list_groups: excluded={excluded_graphs}')
+
+        redis_conn = self.client.connection
+        group_ids = []
+
+        # Scan keys (non-blocking, cursor-based)
+        keys = []
+        async for key in redis_conn.scan_iter(match='*', count=100):
+            keys.append(key)
+        logger.debug(f'list_groups: found {len(keys)} keys')
+
+        for key in keys:
+            # Decode if bytes
+            if isinstance(key, bytes):
+                key = key.decode('utf-8')
+
+            # Skip internal/system keys
+            if key.startswith('_') or key.startswith('graphiti:') or key.startswith('telemetry{'):
+                continue
+
+            # Skip known system graphs
+            if key.lower() in excluded_graphs:
+                continue
+
+            # Check if it's a FalkorDB graph
+            key_type = await redis_conn.type(key)
+            if isinstance(key_type, bytes):
+                key_type = key_type.decode('utf-8')
+
+            if key_type == 'graphdata':
+                group_ids.append(key)
+                logger.debug(f'list_groups: found graph {key}')
+
+        logger.debug(f'list_groups: returning {len(group_ids)} groups')
+        return sorted(group_ids)
+
+    async def delete_group(self, group_id: str) -> None:
+        """
+        Delete a FalkorDB graph completely.
+
+        In FalkorDB, each group_id is a separate Redis graph key.
+        Uses GRAPH.DELETE to remove the entire graph.
+        """
+        redis_conn = self.client.connection
+        await redis_conn.execute_command('GRAPH.DELETE', group_id)
+        logger.info(f'Deleted graph {group_id}')
