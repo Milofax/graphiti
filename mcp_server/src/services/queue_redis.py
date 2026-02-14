@@ -4,6 +4,7 @@ Features:
 - Messages persist in Redis (survives service restarts)
 - Consumer Groups with XACK for guaranteed delivery
 - XAUTOCLAIM for recovering abandoned messages after crashes
+- Exponential backoff on transient errors (LLM unavailable etc.)
 - Task references stored to prevent Python GC from collecting workers
 """
 
@@ -22,6 +23,8 @@ from graphiti_core.nodes import EpisodeType
 from .queue_backend import EpisodeData, QueueBackend
 
 logger = logging.getLogger(__name__)
+
+MAX_BACKOFF_SECONDS = 60
 
 
 @dataclass
@@ -79,6 +82,7 @@ class RedisStreamsBackend(QueueBackend):
     - Persistent: Messages survive service restarts
     - Guaranteed delivery: Consumer Groups with acknowledgment
     - Crash recovery: XAUTOCLAIM recovers abandoned messages
+    - Backoff: Exponential backoff on errors, messages are never lost
     - No GC issues: Worker task references are stored
     """
 
@@ -91,6 +95,7 @@ class RedisStreamsBackend(QueueBackend):
         # Task references stored to prevent GC collection
         self._worker_tasks: dict[str, asyncio.Task] = {}
         self._worker_running: dict[str, bool] = {}
+        self._actively_processing: set[str] = set()
         self._shutting_down: bool = False
 
         # Unique consumer name per instance
@@ -239,18 +244,25 @@ class RedisStreamsBackend(QueueBackend):
         def on_done(t: asyncio.Task):
             self._worker_tasks.pop(group_id, None)
             self._worker_running[group_id] = False
+            self._actively_processing.discard(group_id)
             if t.exception() and not self._shutting_down:
                 logger.error(f'Worker for {group_id} crashed: {t.exception()}')
 
         task.add_done_callback(on_done)
 
     async def _process_stream(self, group_id: str) -> None:
-        """Process messages from Redis Stream for a group_id."""
+        """Process messages from Redis Stream for a group_id.
+
+        Uses a two-phase read: first check for pending (previously failed) messages,
+        then read new messages. Exponential backoff on consecutive errors prevents
+        rapid retry exhaustion when the LLM is temporarily unavailable.
+        """
         if self._redis is None:
             raise RuntimeError('Queue backend not initialized')
 
         stream_key = self._stream_key(group_id)
         logger.info(f'Starting stream worker for {group_id}')
+        consecutive_errors = 0
 
         try:
             await self._claim_abandoned(group_id)
@@ -264,25 +276,65 @@ class RedisStreamsBackend(QueueBackend):
                     reclaim_counter = 0
                     await self._claim_abandoned(group_id)
 
+                # Phase 1: Check for pending (unacked) messages from previous failures
+                message_to_process = None
                 try:
-                    messages = await self._redis.xreadgroup(
+                    pending = await self._redis.xreadgroup(
                         groupname=self._config.consumer_group,
                         consumername=self._consumer_name,
-                        streams={stream_key: '>'},
+                        streams={stream_key: '0'},
                         count=1,
-                        block=self._config.block_ms,
                     )
+                    if pending:
+                        for _stream_name, stream_messages in pending:
+                            if stream_messages:
+                                message_to_process = stream_messages[0]
+                                break
                 except redis.ConnectionError as e:
                     logger.error(f'Redis connection error for {group_id}: {e}')
                     await asyncio.sleep(5)
                     continue
 
-                if not messages:
+                # Phase 2: No pending messages, block-read for new ones
+                if message_to_process is None:
+                    try:
+                        messages = await self._redis.xreadgroup(
+                            groupname=self._config.consumer_group,
+                            consumername=self._consumer_name,
+                            streams={stream_key: '>'},
+                            count=1,
+                            block=self._config.block_ms,
+                        )
+                        if messages:
+                            for _stream_name, stream_messages in messages:
+                                if stream_messages:
+                                    message_to_process = stream_messages[0]
+                                    break
+                    except redis.ConnectionError as e:
+                        logger.error(f'Redis connection error for {group_id}: {e}')
+                        await asyncio.sleep(5)
+                        continue
+
+                if message_to_process is None:
                     continue
 
-                for _stream_name, stream_messages in messages:
-                    for message_id, data in stream_messages:
-                        await self._process_message(group_id, message_id, data)
+                message_id, data = message_to_process
+                self._actively_processing.add(group_id)
+                try:
+                    success = await self._process_message(group_id, message_id, data)
+                finally:
+                    self._actively_processing.discard(group_id)
+
+                if success:
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
+                    delay = min(2 ** consecutive_errors, MAX_BACKOFF_SECONDS)
+                    logger.warning(
+                        f'Backing off {delay}s for {group_id} '
+                        f'({consecutive_errors} consecutive error(s))'
+                    )
+                    await asyncio.sleep(delay)
 
         except asyncio.CancelledError:
             logger.info(f'Worker for {group_id} cancelled')
@@ -291,24 +343,20 @@ class RedisStreamsBackend(QueueBackend):
             raise
         finally:
             self._worker_running[group_id] = False
+            self._actively_processing.discard(group_id)
             logger.info(f'Stopped worker for {group_id}')
 
-    async def _process_message(self, group_id: str, message_id: str, data: dict) -> None:
-        """Process a single message from the stream."""
+    async def _process_message(self, group_id: str, message_id: str, data: dict) -> bool:
+        """Process a single message from the stream.
+
+        Returns True on success. On failure, the message is NOT acknowledged
+        and stays pending for retry with backoff.
+        """
         if self._redis is None:
             raise RuntimeError('Queue backend not initialized')
 
         stream_key = self._stream_key(group_id)
         episode = EpisodeMessage.from_stream_data(message_id, data)
-
-        # Check retry limit before processing
-        if episode.retry_count >= self._config.max_retries:
-            logger.warning(
-                f'Max retries ({self._config.max_retries}) exceeded for {message_id} '
-                f'(uuid={episode.uuid}), giving up'
-            )
-            await self._redis.xack(stream_key, self._config.consumer_group, message_id)
-            return
 
         try:
             logger.info(f'Processing episode {episode.uuid} for {group_id}')
@@ -326,21 +374,21 @@ class RedisStreamsBackend(QueueBackend):
 
             await self._redis.xack(stream_key, self._config.consumer_group, message_id)
             logger.info(f'Successfully processed episode {episode.uuid}')
+            return True
 
         except Exception as e:
             logger.error(f'Failed to process {message_id} (uuid={episode.uuid}): {e}')
-
-            # Re-queue with incremented retry count, then ACK the failed message
-            try:
-                retry_data = episode.to_dict()
-                retry_data['retry_count'] = str(episode.retry_count + 1)
-                await self._redis.xadd(stream_key, retry_data)
-                await self._redis.xack(stream_key, self._config.consumer_group, message_id)
-            except Exception as retry_err:
-                logger.error(f'Failed to re-queue {message_id}: {retry_err}')
+            # Don't ACK, don't re-queue — message stays pending for retry with backoff
+            return False
 
     async def _claim_abandoned(self, group_id: str) -> None:
-        """Claim and reprocess abandoned messages from previous crashes."""
+        """Claim abandoned messages from dead consumers.
+
+        Uses XAUTOCLAIM to transfer ownership of messages that have been idle
+        too long (from crashed workers or previous instances). The messages
+        are claimed to this consumer and will be picked up by the main loop's
+        pending-read phase.
+        """
         if self._redis is None:
             return
 
@@ -364,17 +412,14 @@ class RedisStreamsBackend(QueueBackend):
 
                 next_cursor = result[0]
                 claimed_messages = result[1]
-
-                for message_id, data in claimed_messages:
-                    await self._process_message(group_id, message_id, data)
-                    total_claimed += 1
+                total_claimed += len(claimed_messages)
 
                 if next_cursor == '0-0' or next_cursor == '0':
                     break
                 cursor = next_cursor
 
             if total_claimed > 0:
-                logger.info(f'Claimed and processed {total_claimed} abandoned messages for {group_id}')
+                logger.info(f'Claimed {total_claimed} abandoned messages for {group_id}')
 
         except redis.ResponseError as e:
             if 'NOGROUP' not in str(e):
@@ -470,17 +515,17 @@ class RedisStreamsBackend(QueueBackend):
                 total_count = pending_count + lag_count
                 total_pending += total_count
 
-                is_processing = self._worker_running.get(group_id, False)
-                if is_processing:
+                is_active = group_id in self._actively_processing
+                if is_active:
                     currently_processing += 1
 
-                if total_count > 0 or is_processing:
+                if total_count > 0 or is_active:
                     groups_info.append({
                         'group_id': group_id,
                         'pending': pending_count,
                         'queued': lag_count,
                         'total': total_count,
-                        'processing': is_processing,
+                        'processing': is_active,
                     })
         except Exception as e:
             logger.error(f'Error getting all pending: {e}')
