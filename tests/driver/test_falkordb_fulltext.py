@@ -63,6 +63,31 @@ class TestStopwordsExpansion:
             assert word == word.lower(), f'STOPWORDS entry "{word}" is not lowercase'
 
 
+def _extract_terms(fulltext_result: str) -> list[str]:
+    """Extract search terms from build_fulltext_query result.
+
+    The result format is: [group_filter] (term1 | term2 | ...)
+    This helper strips the group filter and parentheses, returning just the terms.
+    """
+    result = fulltext_result.strip()
+    # Remove group_id prefix if present: (@group_id:"val") (terms...)
+    if result.startswith('(@'):
+        # Find the end of the group filter
+        paren_depth = 0
+        for i, c in enumerate(result):
+            if c == '(':
+                paren_depth += 1
+            elif c == ')':
+                paren_depth -= 1
+                if paren_depth == 0:
+                    result = result[i + 1 :].strip()
+                    break
+    # Remove outer parentheses from the query terms
+    if result.startswith('(') and result.endswith(')'):
+        result = result[1:-1]
+    return [t.strip() for t in result.split('|')]
+
+
 @unittest.skipIf(not HAS_FALKORDB, 'FalkorDB is not installed')
 class TestMaxFulltextTerms:
     """MAX_FULLTEXT_TERMS constant must exist and cap OR-terms."""
@@ -87,7 +112,7 @@ class TestMaxFulltextTerms:
         ]
         query = ' '.join(words)
         result = self.driver.build_fulltext_query(query)
-        terms = [t.strip() for t in result.split('|')]
+        terms = _extract_terms(result)
         assert len(terms) <= MAX_FULLTEXT_TERMS, (
             f'Expected max {MAX_FULLTEXT_TERMS} terms, got {len(terms)}'
         )
@@ -96,14 +121,14 @@ class TestMaxFulltextTerms:
         """Query with 3 non-stopword terms keeps all 3."""
         query = 'Graphiti knowledge graph'
         result = self.driver.build_fulltext_query(query)
-        terms = [t.strip() for t in result.split('|')]
+        terms = _extract_terms(result)
         assert len(terms) == 3
 
     def test_build_fulltext_query_german_stopwords_filtered(self):
         """German stopwords are filtered from the query."""
         query = 'der Benutzer hat eine Anfrage'
         result = self.driver.build_fulltext_query(query)
-        terms = [t.strip() for t in result.split('|')]
+        terms = _extract_terms(result)
         # 'der', 'hat', 'eine' should be filtered; 'Benutzer', 'Anfrage' remain
         assert 'Benutzer' in terms
         assert 'Anfrage' in terms
@@ -113,7 +138,7 @@ class TestMaxFulltextTerms:
         """Mixed DE/EN input filters stopwords from both languages."""
         query = 'the user goes into his own domain and der content wird generally used'
         result = self.driver.build_fulltext_query(query)
-        terms = [t.strip() for t in result.split('|')]
+        terms = _extract_terms(result)
         # Most words are stopwords: the, user(?), goes, into, his, own, and, der, wird, generally
         # 'user' is NOT a stopword, 'domain' is NOT, 'content' is NOT, 'used' IS
         # Verify none of the known stopwords appear
@@ -130,7 +155,18 @@ class TestMaxFulltextTerms:
         )
         result = self.driver.build_fulltext_query(query)
         if result:  # Could be empty if all terms are stopwords
-            terms = [t.strip() for t in result.split('|')]
+            terms = _extract_terms(result)
             assert len(terms) <= MAX_FULLTEXT_TERMS, (
                 f'Timeout query still produces {len(terms)} terms (max {MAX_FULLTEXT_TERMS})'
             )
+
+    def test_build_fulltext_query_group_id_escaping(self):
+        """group_ids are escaped with quotes in the RediSearch query."""
+        query = 'test query'
+        result = self.driver.build_fulltext_query(query, group_ids=['main', 'my-project'])
+        # Group filter should escape with quotes: (@group_id:"main"|"my-project")
+        assert '(@group_id:"main"|"my-project")' in result
+        # Query terms should still be present
+        terms = _extract_terms(result)
+        assert 'test' in terms
+        assert 'query' in terms

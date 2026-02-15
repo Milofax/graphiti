@@ -389,12 +389,22 @@ class FalkorDriver(GraphDriver):
     ) -> str:
         """
         Build a fulltext query string for FalkorDB using RedisSearch syntax.
-
-        NOTE: For FalkorDB, we do NOT include group_id filtering in the fulltext query.
-        The Cypher WHERE clause (e.g., WHERE n.group_id IN $group_ids) already handles
-        group_id filtering, and including it here causes RediSearch syntax errors with
-        reserved words like "main" and special characters like hyphens.
+        FalkorDB uses RedisSearch-like syntax where:
+        - Field queries use @ prefix: @field:value
+        - Multiple values for same field: (@field:value1|value2)
+        - Text search doesn't need @ prefix for content fields
+        - AND is implicit with space: (@group_id:value) (text)
+        - OR uses pipe within parentheses: (@group_id:value1|value2)
         """
+        if group_ids is None or len(group_ids) == 0:
+            group_filter = ''
+        else:
+            # Escape group_ids with quotes to prevent RediSearch syntax errors
+            # with reserved words like "main" or special characters like hyphens
+            escaped_group_ids = [f'"{gid}"' for gid in group_ids]
+            group_values = '|'.join(escaped_group_ids)
+            group_filter = f'(@group_id:{group_values})'
+
         sanitized_query = self.sanitize(query)
 
         # Remove stopwords and empty tokens from the sanitized query
@@ -411,7 +421,9 @@ class FalkorDriver(GraphDriver):
         if len(sanitized_query.split(' ')) + len(group_ids or '') >= max_query_length:
             return ''
 
-        return sanitized_query
+        full_query = group_filter + ' (' + sanitized_query + ')'
+
+        return full_query
 
     async def copy_group(self, source_group_id: str, target_group_id: str) -> None:
         """
