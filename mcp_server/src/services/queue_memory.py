@@ -211,9 +211,10 @@ class InMemoryBackend(QueueBackend):
 
         logger.info('In-Memory backend shutdown complete')
 
-    def get_queue_size(self) -> int:
-        """Get total pending message count."""
-        return sum(q.qsize() for q in self._queues.values())
+    def get_queue_size(self, group_id: str) -> int:
+        """Get pending message count for a group_id."""
+        queue = self._queues.get(group_id)
+        return queue.qsize() if queue else 0
 
     async def get_all_pending_count_async(self) -> tuple[int, int, list[dict]]:
         """Get total pending count, active workers, and per-group breakdown."""
@@ -236,9 +237,9 @@ class InMemoryBackend(QueueBackend):
 
         return total_pending, currently_processing, groups_info
 
-    def is_worker_running(self) -> bool:
-        """Check if any worker is running."""
-        return any(self._worker_running.values())
+    def is_worker_running(self, group_id: str) -> bool:
+        """Check if a worker is running for a group_id."""
+        return self._worker_running.get(group_id, False)
 
     # Alias for ABC compatibility (local/combined uses get_status)
     get_status = get_all_pending_count_async

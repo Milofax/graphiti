@@ -274,8 +274,7 @@ class EmbedderFactory:
                     api_key=api_key,
                     base_url=config.providers.openai.api_url,
                     embedding_model=config.model,
-                    base_url=config.providers.openai.api_url,  # Support custom endpoints like Ollama
-                    embedding_dim=config.dimensions,  # Support custom embedding dimensions
+                    embedding_dim=config.dimensions,
                 )
                 return OpenAIEmbedder(config=embedder_config)
 

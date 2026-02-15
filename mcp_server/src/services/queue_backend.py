@@ -86,16 +86,16 @@ class QueueBackend(ABC):
         ...
 
     @abstractmethod
-    def get_queue_size(self) -> int:
-        """Get total pending message count.
+    def get_queue_size(self, group_id: str) -> int:
+        """Get pending message count for a group_id.
 
         Note: May be approximate depending on backend.
         """
         ...
 
     @abstractmethod
-    def is_worker_running(self) -> bool:
-        """Check if the worker is running."""
+    def is_worker_running(self, group_id: str) -> bool:
+        """Check if a worker is running for a group_id."""
         ...
 
     @abstractmethod

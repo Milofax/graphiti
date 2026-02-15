@@ -514,6 +514,94 @@ async def add_memory(
 
 
 @mcp.tool()
+async def create_entity_node(
+    name: str,
+    group_id: str | None = None,
+    entity_type: str = 'Entity',
+    summary: str = '',
+    attributes: dict[str, Any] | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Create a new entity node directly in the knowledge graph (without LLM extraction).
+
+    Use this to manually add a specific entity node. For bulk/natural-language ingestion,
+    use add_memory instead.
+
+    Args:
+        name: Name of the entity
+        group_id: Optional group/graph ID. Falls back to the configured default.
+        entity_type: Label/type of the entity, e.g. 'Weapon', 'Player' (default: 'Entity')
+        summary: Optional description of the entity
+        attributes: Optional additional attributes as a dict
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+        effective_group_id = group_id or config.graphiti.group_id
+
+        node = await client.create_entity(
+            name=name,
+            group_id=effective_group_id,
+            entity_type=entity_type,
+            summary=summary,
+            attributes=attributes,
+        )
+
+        return format_node_result(node)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error creating entity node: {error_msg}')
+        return ErrorResponse(error=f'Error creating entity node: {error_msg}')
+
+
+@mcp.tool()
+async def create_entity_edge(
+    source_node_uuid: str,
+    target_node_uuid: str,
+    name: str,
+    fact: str,
+    group_id: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Create a new edge (relationship) between two entity nodes directly in the knowledge graph.
+
+    Use this to manually add a specific relationship. For bulk/natural-language ingestion,
+    use add_memory instead.
+
+    Args:
+        source_node_uuid: UUID of the source entity node
+        target_node_uuid: UUID of the target entity node
+        name: Relationship type in UPPER_SNAKE_CASE, e.g. 'HAS_WEAPON'
+        fact: Fact text describing the relationship
+        group_id: Optional group/graph ID. Falls back to the configured default.
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+        effective_group_id = group_id or config.graphiti.group_id
+
+        edge = await client.create_edge(
+            source_node_uuid=source_node_uuid,
+            target_node_uuid=target_node_uuid,
+            name=name,
+            fact=fact,
+            group_id=effective_group_id,
+        )
+
+        return format_fact_result(edge)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error creating entity edge: {error_msg}')
+        return ErrorResponse(error=f'Error creating entity edge: {error_msg}')
+
+
+@mcp.tool()
 async def search_nodes(
     query: str,
     group_ids: list[str] | None = None,
@@ -1129,11 +1217,14 @@ async def update_entity_node(
     uuid: str,
     name: str | None = None,
     summary: str | None = None,
-    labels: list[str] | None = None,
+    entity_type: str | None = None,
     attributes: dict[str, Any] | None = None,
     group_id: str | None = None,
 ) -> dict[str, Any] | ErrorResponse:
     """Update an existing entity node in the graph memory.
+
+    Delegates to Graphiti.update_entity() which handles embedding regeneration
+    and DB routing internally.
 
     Use this tool to modify an existing entity when you know its UUID.
     This is preferred over add_memory when correcting facts about existing entities,
@@ -1143,7 +1234,7 @@ async def update_entity_node(
         uuid: UUID of the entity node to update (required)
         name: New name for the entity (optional)
         summary: New summary for the entity (optional)
-        labels: New labels for the entity, replaces existing labels (optional)
+        entity_type: New entity type/label, e.g. 'Weapon', 'Player' (optional)
         attributes: Attributes to merge into existing attributes (optional)
         group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
 
@@ -1157,47 +1248,18 @@ async def update_entity_node(
 
     try:
         client = await graphiti_service.get_client()
-        driver = _get_driver(client, group_id)
+        effective_group_id = group_id or config.graphiti.group_id
 
-        # Get the existing entity node
-        entity_node = await EntityNode.get_by_uuid(driver, uuid)
+        node = await client.update_entity(
+            uuid=uuid,
+            name=name,
+            summary=summary,
+            entity_type=entity_type,
+            attributes=attributes,
+            group_id=effective_group_id,
+        )
 
-        # Track what was changed for logging
-        changes = []
-
-        # Update fields if provided
-        if name is not None and name != entity_node.name:
-            entity_node.name = name
-            changes.append(f'name -> "{name}"')
-
-        if summary is not None and summary != entity_node.summary:
-            entity_node.summary = summary
-            changes.append(f'summary updated')
-
-        if labels is not None:
-            entity_node.labels = labels
-            changes.append(f'labels -> {labels}')
-
-        if attributes is not None:
-            # Merge new attributes into existing ones
-            entity_node.attributes = {**entity_node.attributes, **attributes}
-            changes.append(f'attributes merged: {list(attributes.keys())}')
-
-        if not changes:
-            return format_node_result(entity_node)
-
-        # Regenerate embeddings if name or summary changed
-        if name is not None:
-            await entity_node.generate_name_embedding(client.embedder)
-        if summary is not None:
-            await entity_node.generate_summary_embedding(client.embedder)
-
-        # Save the updated node
-        await entity_node.save(driver)
-
-        logger.info(f'Updated entity {uuid}: {", ".join(changes)}')
-
-        return format_node_result(entity_node)
+        return format_node_result(node)
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error updating entity: {error_msg}')
@@ -1207,23 +1269,24 @@ async def update_entity_node(
 @mcp.tool()
 async def update_entity_edge(
     uuid: str,
-    source_node_uuid: str | None = None,
-    target_node_uuid: str | None = None,
     fact: str | None = None,
     name: str | None = None,
     group_id: str | None = None,
 ) -> dict[str, Any] | ErrorResponse:
     """Update an existing entity edge (fact/relationship) in the graph memory.
 
-    Use this tool to modify an edge's endpoints or content. This is particularly useful for:
-    - Moving edges from duplicate nodes to the original node (merging duplicates)
-    - Correcting the fact text of an existing relationship
-    - Changing the relationship type (name)
+    Delegates to Graphiti.update_edge() which handles embedding regeneration
+    and DB routing internally.
+
+    Use this tool to modify an existing relationship when you know its UUID.
+    This is particularly useful for correcting the fact text or changing
+    the relationship type (name).
+
+    Note: Endpoint changes (source/target node) are not supported. To move an edge,
+    delete it and create a new one with create_entity_edge.
 
     Args:
         uuid: UUID of the entity edge to update (required)
-        source_node_uuid: New source node UUID (optional, must exist)
-        target_node_uuid: New target node UUID (optional, must exist)
         fact: New fact text describing the relationship (optional)
         name: New relationship type name in UPPER_SNAKE_CASE (optional)
         group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
@@ -1238,71 +1301,16 @@ async def update_entity_edge(
 
     try:
         client = await graphiti_service.get_client()
-        driver = _get_driver(client, group_id)
+        effective_group_id = group_id or config.graphiti.group_id
 
-        # Get the existing edge
-        entity_edge = await EntityEdge.get_by_uuid(driver, uuid)
+        edge = await client.update_edge(
+            uuid=uuid,
+            name=name,
+            fact=fact,
+            group_id=effective_group_id,
+        )
 
-        # Track changes and detect endpoint changes
-        changes = []
-        endpoints_changed = False
-        original_source = entity_edge.source_node_uuid
-        original_target = entity_edge.target_node_uuid
-
-        # Validate and update source node
-        if source_node_uuid is not None and source_node_uuid != entity_edge.source_node_uuid:
-            # Verify the new source node exists
-            await EntityNode.get_by_uuid(driver, source_node_uuid)
-            entity_edge.source_node_uuid = source_node_uuid
-            changes.append(f'source_node_uuid -> {source_node_uuid}')
-            endpoints_changed = True
-
-        # Validate and update target node
-        if target_node_uuid is not None and target_node_uuid != entity_edge.target_node_uuid:
-            # Verify the new target node exists
-            await EntityNode.get_by_uuid(driver, target_node_uuid)
-            entity_edge.target_node_uuid = target_node_uuid
-            changes.append(f'target_node_uuid -> {target_node_uuid}')
-            endpoints_changed = True
-
-        # Update fact text
-        if fact is not None and fact != entity_edge.fact:
-            entity_edge.fact = fact
-            changes.append('fact updated')
-
-        # Update relationship name
-        if name is not None and name != entity_edge.name:
-            entity_edge.name = name
-            changes.append(f'name -> {name}')
-
-        if not changes:
-            return format_fact_result(entity_edge)
-
-        # Regenerate fact embedding if fact changed
-        if fact is not None:
-            await entity_edge.generate_embedding(client.embedder)
-
-        # If endpoints changed, we must delete old edge first then create new one
-        # (Graph DBs don't allow changing edge endpoints in place)
-        if endpoints_changed:
-            # Delete the old edge using direct query to ensure it's removed
-            await driver.execute_query(
-                """
-                MATCH (:Entity {uuid: $source_uuid})-[e:RELATES_TO {uuid: $edge_uuid}]->(:Entity {uuid: $target_uuid})
-                DELETE e
-                """,
-                source_uuid=original_source,
-                target_uuid=original_target,
-                edge_uuid=uuid,
-            )
-            logger.info(f'Deleted old edge {uuid} from {original_source} -> {original_target}')
-
-        # Save the edge (creates new if endpoints changed, updates if not)
-        await entity_edge.save(driver)
-
-        logger.info(f'Updated entity edge {uuid}: {", ".join(changes)}')
-
-        return format_fact_result(entity_edge)
+        return format_fact_result(edge)
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error updating entity edge: {error_msg}')
@@ -1505,6 +1513,42 @@ async def http_delete_entity_type(request) -> JSONResponse:
         return JSONResponse({'error': 'Internal error deleting entity type'}, status_code=500)
 
 
+@mcp.custom_route('/queue/status', methods=['GET'])
+async def queue_status(request) -> JSONResponse:
+    """Get queue processing status for UI polling.
+
+    Returns:
+        - total_pending: Total messages waiting across all groups
+        - currently_processing: Number of active workers
+        - groups: Per-group breakdown (optional, if group_id param provided)
+    """
+    global queue_service
+
+    if queue_service is None:
+        return JSONResponse({
+            'total_pending': 0,
+            'currently_processing': 0,
+            'error': 'Queue service not initialized',
+        })
+
+    try:
+        total_pending, currently_processing, groups = await queue_service.get_status()
+        result = {
+            'total_pending': total_pending,
+            'currently_processing': currently_processing,
+        }
+        if groups:
+            result['groups'] = groups
+        return JSONResponse(result)
+    except Exception as e:
+        logger.error(f'Error getting queue status: {e}')
+        return JSONResponse({
+            'total_pending': 0,
+            'currently_processing': 0,
+            'error': 'Internal server error',
+        })
+
+
 # =============================================================================
 # HTTP Endpoints for Groups and Stats (DB-neutral)
 # =============================================================================
@@ -1560,43 +1604,6 @@ async def http_get_stats(request) -> JSONResponse:
     except Exception as e:
         logger.error(f'Error getting stats: {e}')
         return JSONResponse({'error': 'Internal server error'}, status_code=500)
-
-
-@mcp.custom_route('/queue/status', methods=['GET'])
-async def queue_status(request) -> JSONResponse:
-    """Get queue processing status for UI polling.
-
-    Returns:
-        - total_pending: Total messages waiting across all groups
-        - currently_processing: Number of active workers
-        - groups: Per-group breakdown (optional, if group_id param provided)
-    """
-    global queue_service
-
-    if queue_service is None:
-        return JSONResponse({
-            'total_pending': 0,
-            'currently_processing': 0,
-            'error': 'Queue service not initialized',
-        })
-
-    try:
-        total_pending, currently_processing, groups = await queue_service.get_status()
-        result = {
-            'total_pending': total_pending,
-            'currently_processing': currently_processing,
-        }
-        if groups:
-            result['groups'] = groups
-        return JSONResponse(result)
-    except Exception as e:
-        logger.error(f'Error getting queue status: {e}')
-        return JSONResponse({
-            'total_pending': 0,
-            'currently_processing': 0,
-            'error': 'Internal server error',
-        })
-
 
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""

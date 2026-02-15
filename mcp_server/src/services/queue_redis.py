@@ -1,25 +1,20 @@
 """Redis Streams backend for persistent episode processing.
 
-Uses a single stream (graphiti:queue) for all group_ids. Messages carry
-their group_id as a field. Failed messages are moved to a Dead Letter Queue
-(graphiti:queue:dlq) after max_retries instead of being discarded.
-
 Features:
-- Single stream: no orphaned queues, one consumer group, one worker
-- DLQ: failed messages preserved for inspection instead of silently deleted
-- Migration: legacy per-group streams are migrated on first startup
-- Crash recovery: XAUTOCLAIM recovers abandoned messages
-- Exponential backoff on transient errors
+- Messages persist in Redis (survives service restarts)
+- Consumer Groups with XACK for guaranteed delivery
+- XAUTOCLAIM for recovering abandoned messages after crashes
+- Exponential backoff on transient errors (LLM unavailable etc.)
+- Task references stored to prevent Python GC from collecting workers
 """
 
 import asyncio
-import json
 import logging
 import os
+import socket
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import redis.asyncio as redis
 
@@ -30,15 +25,6 @@ from .queue_backend import EpisodeData, QueueBackend
 logger = logging.getLogger(__name__)
 
 MAX_BACKOFF_SECONDS = 60
-STREAM_KEY = 'graphiti:queue'
-DLQ_KEY = 'graphiti:queue:dlq'
-LEGACY_KEY = 'graphiti:queue:legacy'
-XTRIM_MAXLEN = 5000
-
-# Legacy throttle time window (CET/CEST)
-THROTTLE_TZ = ZoneInfo('Europe/Berlin')
-THROTTLE_HOUR_START = 9   # 09:00
-THROTTLE_HOUR_END = 22    # 22:00
 
 
 @dataclass
@@ -51,7 +37,6 @@ class RedisQueueConfig:
     claim_min_idle_ms: int = 60000  # Reclaim messages idle for 60 seconds
     max_retries: int = 3
     shutdown_timeout: float = 30.0
-    throttle_seconds: float = 0.0  # Pause between legacy messages (0 = no drainer)
 
 
 @dataclass
@@ -88,17 +73,17 @@ class EpisodeMessage(EpisodeData):
 
 
 class RedisStreamsBackend(QueueBackend):
-    """Persistent queue backend using a single Redis Stream.
+    """Persistent queue backend using Redis Streams.
 
-    All group_ids share one stream (graphiti:queue). The group_id travels
-    as a message field. One worker processes messages sequentially.
+    This backend manages episode processing queues per group_id using Redis Streams.
+    Each group_id gets its own stream (graphiti:queue:{group_id}).
 
     Features:
     - Persistent: Messages survive service restarts
-    - Guaranteed delivery: Consumer Group with acknowledgment
-    - DLQ: Failed messages moved to graphiti:queue:dlq after max_retries
+    - Guaranteed delivery: Consumer Groups with acknowledgment
     - Crash recovery: XAUTOCLAIM recovers abandoned messages
-    - Migration: Legacy per-group streams migrated on first startup
+    - Backoff: Exponential backoff on errors, messages are never lost
+    - No GC issues: Worker task references are stored
     """
 
     def __init__(self, config: RedisQueueConfig | None = None):
@@ -107,15 +92,18 @@ class RedisStreamsBackend(QueueBackend):
         self._graphiti_client: Any = None
         self._entity_types: Any = None
 
-        # Single worker state
-        self._worker_task: asyncio.Task | None = None
-        self._drainer_task: asyncio.Task | None = None
-        self._worker_running: bool = False
-        self._actively_processing: bool = False
+        # Task references stored to prevent GC collection
+        self._worker_tasks: dict[str, asyncio.Task] = {}
+        self._worker_running: dict[str, bool] = {}
+        self._actively_processing: set[str] = set()
         self._shutting_down: bool = False
 
-        # Stable consumer name — survives container restarts (same PEL ownership)
-        self._consumer_name = os.environ.get('GRAPHITI_CONSUMER_NAME', 'worker_0')
+        # Unique consumer name per instance
+        self._consumer_name = f'worker_{socket.gethostname()}_{os.getpid()}'
+
+    def _stream_key(self, group_id: str) -> str:
+        """Get Redis Stream key for a group_id."""
+        return f'graphiti:queue:{group_id}'
 
     async def initialize(
         self,
@@ -124,7 +112,13 @@ class RedisStreamsBackend(QueueBackend):
         entity_types: Any = None,
         **kwargs,
     ) -> None:
-        """Initialize with graphiti client and Redis connection."""
+        """Initialize with graphiti client and Redis connection.
+
+        Args:
+            graphiti_client: The Graphiti client instance for processing episodes
+            redis_client: Optional Redis client (creates new if not provided)
+            entity_types: Entity types dict for extraction
+        """
         self._graphiti_client = graphiti_client
         self._entity_types = entity_types
 
@@ -135,229 +129,55 @@ class RedisStreamsBackend(QueueBackend):
 
         logger.info(f'Redis Streams backend initialized with consumer: {self._consumer_name}')
 
-        # Create consumer group on the single stream (idempotent)
-        try:
-            await self._redis.xgroup_create(
-                STREAM_KEY, self._config.consumer_group, id='0', mkstream=True
-            )
-            logger.info('Created consumer group on single stream')
-        except redis.ResponseError as e:
-            if 'BUSYGROUP' not in str(e):
-                raise
+        # Eager startup: resume workers for streams that have unprocessed messages
+        await self._resume_pending_streams()
 
-        # Migrate legacy per-group streams
-        await self._migrate_legacy_streams()
+    async def _resume_pending_streams(self) -> None:
+        """Resume workers for any streams that have unprocessed messages.
 
-        # Start worker if there are unprocessed messages
-        await self._start_worker_if_needed()
-
-        # Start legacy drainer if configured
-        if self._config.throttle_seconds > 0:
-            await self._start_legacy_drainer()
-
-    async def _migrate_legacy_streams(self) -> None:
-        """Migrate messages from legacy per-group streams to the single stream.
-
-        Scans for graphiti:queue:* keys (excluding the main stream and DLQ),
-        copies unprocessed messages to STREAM_KEY, then deletes the old stream.
+        This runs at startup to ensure no episodes are lost after a crash or restart.
         """
         if self._redis is None:
             return
 
         try:
-            legacy_keys: list[str] = []
+            keys: list[str] = []
             async for key in self._redis.scan_iter(match='graphiti:queue:*', count=100):
-                if isinstance(key, bytes):
-                    key = key.decode('utf-8')
-                # Skip the single stream itself and DLQ
-                if key == STREAM_KEY or key == DLQ_KEY or ':dlq' in key:
-                    continue
-                legacy_keys.append(key)
+                if ':dlq' not in key:
+                    keys.append(key)
 
-            if not legacy_keys:
-                logger.info('No legacy streams to migrate')
+            if not keys:
                 return
 
-            total_migrated = 0
-            total_skipped = 0
-
-            for legacy_key in legacy_keys:
-                group_id = legacy_key.removeprefix('graphiti:queue:')
+            resumed = 0
+            for stream_key in keys:
+                group_id = stream_key.removeprefix('graphiti:queue:')
 
                 try:
-                    # Get all messages from the legacy stream
-                    messages = await self._redis.xrange(legacy_key)
-                    if not messages:
-                        await self._redis.delete(legacy_key)
-                        logger.info(f'Deleted empty legacy stream: {legacy_key}')
-                        continue
-
-                    # Determine which messages are already processed (ACK'd)
-                    acked_ids: set[str] = set()
-                    try:
-                        groups = await self._redis.xinfo_groups(legacy_key)
-                        for group in groups:
-                            group_name = group.get('name', '')
-                            # Get pending messages for this consumer group
-                            try:
-                                pending = await self._redis.xpending_range(
-                                    legacy_key, group_name,
-                                    min='-', max='+', count=10000,
-                                )
-                                pending_ids = {p['message_id'] for p in pending}
-                            except Exception:
-                                pending_ids = set()
-
-                            # Messages in stream but NOT in PEL are already processed
-                            all_ids = {msg_id for msg_id, _ in messages}
-                            acked_ids.update(all_ids - pending_ids)
-                    except redis.ResponseError:
-                        # No consumer group — all messages are unprocessed
-                        pass
-
-                    # Migrate unprocessed messages
-                    migrated = 0
-                    skipped = 0
-                    # Choose target: legacy list (if throttled) or main stream
-                    use_legacy = self._config.throttle_seconds > 0
-                    for msg_id, data in messages:
-                        if msg_id in acked_ids:
-                            skipped += 1
+                    groups = await self._redis.xinfo_groups(stream_key)
+                    for group in groups:
+                        if group.get('name') != self._config.consumer_group:
                             continue
-                        # Ensure group_id field is set
-                        if 'group_id' not in data:
-                            data['group_id'] = group_id
-                        if use_legacy:
-                            await self._redis.rpush(LEGACY_KEY, json.dumps(data))
-                        else:
-                            await self._redis.xadd(STREAM_KEY, data)
-                        migrated += 1
+                        lag = group.get('lag', 0) or 0
+                        pending = group.get('pending', 0) or 0
+                        if lag > 0 or pending > 0:
+                            logger.info(
+                                f'Resuming worker for {group_id}: lag={lag}, pending={pending}'
+                            )
+                            await self._ensure_worker_running(group_id)
+                            resumed += 1
+                except redis.ResponseError as e:
+                    logger.debug(f'Could not inspect stream {stream_key}: {e}')
 
-                    total_migrated += migrated
-                    total_skipped += skipped
-
-                    # Delete the legacy stream
-                    await self._redis.delete(legacy_key)
-                    logger.info(
-                        f'Migrated {migrated} messages from {legacy_key} '
-                        f'(skipped {skipped} already processed)'
-                    )
-
-                except Exception as e:
-                    logger.warning(f'Error migrating {legacy_key}: {e}')
-
-            logger.info(
-                f'Migration complete: {total_migrated} messages migrated, '
-                f'{total_skipped} skipped from {len(legacy_keys)} legacy streams'
-            )
+            if resumed > 0:
+                logger.info(f'Resumed {resumed} workers for streams with pending messages')
+            else:
+                logger.info('No pending streams found at startup')
 
         except redis.ConnectionError as e:
-            logger.error(f'Redis connection error during migration: {e}')
+            logger.error(f'Redis connection error during startup scan: {e}')
         except Exception as e:
-            logger.warning(f'Error during legacy stream migration: {e}')
-
-    async def _start_legacy_drainer(self) -> None:
-        """Start the legacy message drainer if there are messages to process."""
-        if self._redis is None:
-            return
-        count = await self._redis.llen(LEGACY_KEY)
-        if count == 0:
-            logger.info('No legacy messages to drain')
-            return
-        logger.info(f'Starting legacy drainer for {count} messages')
-        self._drainer_task = asyncio.create_task(self._drain_legacy())
-
-    async def _drain_legacy(self) -> None:
-        """Drain legacy messages one at a time with throttle + time window."""
-        if self._redis is None:
-            return
-
-        try:
-            while not self._shutting_down:
-                # Time window check: only process during 9:00-22:00 CET
-                now_cet = datetime.now(THROTTLE_TZ)
-                if now_cet.hour < THROTTLE_HOUR_START or now_cet.hour >= THROTTLE_HOUR_END:
-                    next_start = now_cet.replace(
-                        hour=THROTTLE_HOUR_START, minute=0, second=0, microsecond=0
-                    )
-                    if now_cet.hour >= THROTTLE_HOUR_END:
-                        next_start += timedelta(days=1)
-                    sleep_secs = (next_start - now_cet).total_seconds()
-                    logger.info(f'Legacy drainer paused until 09:00 CET ({sleep_secs:.0f}s)')
-                    await asyncio.sleep(sleep_secs)
-                    continue
-
-                # Pop one message from the legacy list
-                raw = await self._redis.lpop(LEGACY_KEY)
-                if raw is None:
-                    logger.info('Legacy drainer complete — all messages processed')
-                    return
-
-                data = json.loads(raw)
-                group_id = data.get('group_id', 'unknown')
-                remaining = await self._redis.llen(LEGACY_KEY)
-                logger.info(
-                    f'Legacy drainer: processing for {group_id} '
-                    f'({remaining} remaining)'
-                )
-
-                # Use a synthetic message_id for logging
-                msg_id = f'legacy-{datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")}'
-                success = await self._process_message(group_id, msg_id, data)
-
-                if not success:
-                    # Put back at front of list for retry
-                    await self._redis.lpush(LEGACY_KEY, json.dumps(data))
-                    logger.warning('Legacy message failed, re-queued for retry')
-
-                # Throttle: sleep between messages
-                logger.debug(f'Legacy drainer: sleeping {self._config.throttle_seconds}s')
-                await asyncio.sleep(self._config.throttle_seconds)
-
-        except asyncio.CancelledError:
-            logger.info('Legacy drainer cancelled')
-        except Exception as e:
-            logger.error(f'Legacy drainer error: {e}')
-
-    async def _start_worker_if_needed(self) -> None:
-        """Start the worker if there are unprocessed messages."""
-        if self._redis is None or self._shutting_down:
-            return
-
-        try:
-            groups = await self._redis.xinfo_groups(STREAM_KEY)
-            for group in groups:
-                if group.get('name') != self._config.consumer_group:
-                    continue
-                lag = group.get('lag', 0) or 0
-                pending = group.get('pending', 0) or 0
-                if lag > 0 or pending > 0:
-                    logger.info(f'Starting worker: lag={lag}, pending={pending}')
-                    self._start_worker()
-                    return
-        except redis.ResponseError:
-            # Stream might not exist yet
-            pass
-        except Exception as e:
-            logger.warning(f'Error checking stream at startup: {e}')
-
-    def _start_worker(self) -> None:
-        """Start the single worker task if not already running."""
-        if self._shutting_down or self._worker_running:
-            return
-
-        self._worker_running = True
-        task = asyncio.create_task(self._process_stream())
-        self._worker_task = task
-
-        def on_done(t: asyncio.Task):
-            self._worker_task = None
-            self._worker_running = False
-            self._actively_processing = False
-            if t.exception() and not self._shutting_down:
-                logger.error(f'Worker crashed: {t.exception()}')
-
-        task.add_done_callback(on_done)
+            logger.warning(f'Error scanning pending streams: {e}')
 
     async def add_episode(
         self,
@@ -369,9 +189,11 @@ class RedisStreamsBackend(QueueBackend):
         entity_types: Any,
         uuid: str | None,
     ) -> str:
-        """Add episode to the single Redis Stream for processing."""
+        """Add episode to Redis Stream for processing."""
         if self._redis is None:
             raise RuntimeError('Queue backend not initialized. Call initialize() first.')
+
+        stream_key = self._stream_key(group_id)
 
         message = EpisodeMessage(
             message_id='',
@@ -383,16 +205,53 @@ class RedisStreamsBackend(QueueBackend):
             uuid=uuid,
         )
 
-        message_id: str = await self._redis.xadd(STREAM_KEY, message.to_dict())  # type: ignore[arg-type]
+        message_id: str = await self._redis.xadd(stream_key, message.to_dict())  # type: ignore[arg-type]
 
         logger.info(f'Queued episode {uuid} for group {group_id}: {message_id}')
 
-        self._start_worker()
+        await self._ensure_worker_running(group_id)
 
         return message_id
 
-    async def _process_stream(self) -> None:
-        """Process messages from the single Redis Stream.
+    async def _ensure_worker_running(self, group_id: str) -> None:
+        """Start worker for group_id if not already running."""
+        if self._shutting_down:
+            return
+
+        if self._worker_running.get(group_id, False):
+            return
+
+        if self._redis is None:
+            return
+
+        stream_key = self._stream_key(group_id)
+
+        try:
+            await self._redis.xgroup_create(
+                stream_key, self._config.consumer_group, id='0', mkstream=True
+            )
+            logger.info(f'Created consumer group for {group_id}')
+        except redis.ResponseError as e:
+            if 'BUSYGROUP' not in str(e):
+                raise
+
+        # Set flag before creating task to prevent duplicate workers (TOCTOU guard)
+        self._worker_running[group_id] = True
+
+        task = asyncio.create_task(self._process_stream(group_id))
+        self._worker_tasks[group_id] = task
+
+        def on_done(t: asyncio.Task):
+            self._worker_tasks.pop(group_id, None)
+            self._worker_running[group_id] = False
+            self._actively_processing.discard(group_id)
+            if t.exception() and not self._shutting_down:
+                logger.error(f'Worker for {group_id} crashed: {t.exception()}')
+
+        task.add_done_callback(on_done)
+
+    async def _process_stream(self, group_id: str) -> None:
+        """Process messages from Redis Stream for a group_id.
 
         Uses a two-phase read: first check for pending (previously failed) messages,
         then read new messages. Exponential backoff on consecutive errors prevents
@@ -401,11 +260,12 @@ class RedisStreamsBackend(QueueBackend):
         if self._redis is None:
             raise RuntimeError('Queue backend not initialized')
 
-        logger.info('Starting stream worker')
+        stream_key = self._stream_key(group_id)
+        logger.info(f'Starting stream worker for {group_id}')
         consecutive_errors = 0
 
         try:
-            await self._claim_abandoned()
+            await self._claim_abandoned(group_id)
 
             reclaim_counter = 0
             RECLAIM_EVERY = 12  # ~60s at 5s block_ms
@@ -414,13 +274,7 @@ class RedisStreamsBackend(QueueBackend):
                 reclaim_counter += 1
                 if reclaim_counter >= RECLAIM_EVERY:
                     reclaim_counter = 0
-                    await self._claim_abandoned()
-                    try:
-                        await self._redis.xtrim(
-                            STREAM_KEY, maxlen=XTRIM_MAXLEN, approximate=True
-                        )
-                    except Exception:
-                        pass
+                    await self._claim_abandoned(group_id)
 
                 # Phase 1: Check for pending (unacked) messages from previous failures
                 message_to_process = None
@@ -428,7 +282,7 @@ class RedisStreamsBackend(QueueBackend):
                     pending = await self._redis.xreadgroup(
                         groupname=self._config.consumer_group,
                         consumername=self._consumer_name,
-                        streams={STREAM_KEY: '0'},
+                        streams={stream_key: '0'},
                         count=1,
                     )
                     if pending:
@@ -437,7 +291,7 @@ class RedisStreamsBackend(QueueBackend):
                                 message_to_process = stream_messages[0]
                                 break
                 except redis.ConnectionError as e:
-                    logger.error(f'Redis connection error: {e}')
+                    logger.error(f'Redis connection error for {group_id}: {e}')
                     await asyncio.sleep(5)
                     continue
 
@@ -447,7 +301,7 @@ class RedisStreamsBackend(QueueBackend):
                         messages = await self._redis.xreadgroup(
                             groupname=self._config.consumer_group,
                             consumername=self._consumer_name,
-                            streams={STREAM_KEY: '>'},
+                            streams={stream_key: '>'},
                             count=1,
                             block=self._config.block_ms,
                         )
@@ -457,54 +311,19 @@ class RedisStreamsBackend(QueueBackend):
                                     message_to_process = stream_messages[0]
                                     break
                     except redis.ConnectionError as e:
-                        logger.error(f'Redis connection error: {e}')
+                        logger.error(f'Redis connection error for {group_id}: {e}')
                         await asyncio.sleep(5)
                         continue
 
                 if message_to_process is None:
                     continue
 
-                # Enforce max_retries via Redis delivery count (PEL)
-                msg_id_check = message_to_process[0]
-                try:
-                    pending_info = await self._redis.xpending_range(
-                        STREAM_KEY, self._config.consumer_group,
-                        min=msg_id_check, max=msg_id_check, count=1,
-                    )
-                    if (
-                        pending_info
-                        and pending_info[0].get('times_delivered', 0) > self._config.max_retries
-                    ):
-                        times = pending_info[0]['times_delivered']
-                        msg_data = message_to_process[1]
-                        logger.warning(
-                            f'Moving {msg_id_check} to DLQ after {times} deliveries: '
-                            f'{msg_data.get("name", "?")}'
-                        )
-                        # Preserve in DLQ with original data + metadata
-                        dlq_data = dict(msg_data)
-                        dlq_data['original_stream_id'] = msg_id_check
-                        dlq_data['times_delivered'] = str(times)
-                        dlq_data['moved_to_dlq_at'] = datetime.now(timezone.utc).isoformat()
-                        await self._redis.xadd(DLQ_KEY, dlq_data)
-                        await self._redis.xack(
-                            STREAM_KEY, self._config.consumer_group, msg_id_check
-                        )
-                        try:
-                            await self._redis.xdel(STREAM_KEY, msg_id_check)
-                        except Exception:
-                            pass
-                        continue
-                except Exception as e:
-                    logger.debug(f'Could not check delivery count for {msg_id_check}: {e}')
-
                 message_id, data = message_to_process
-                group_id = data.get('group_id', 'unknown')
-                self._actively_processing = True
+                self._actively_processing.add(group_id)
                 try:
                     success = await self._process_message(group_id, message_id, data)
                 finally:
-                    self._actively_processing = False
+                    self._actively_processing.discard(group_id)
 
                 if success:
                     consecutive_errors = 0
@@ -512,19 +331,20 @@ class RedisStreamsBackend(QueueBackend):
                     consecutive_errors += 1
                     delay = min(2 ** consecutive_errors, MAX_BACKOFF_SECONDS)
                     logger.warning(
-                        f'Backing off {delay}s ({consecutive_errors} consecutive error(s))'
+                        f'Backing off {delay}s for {group_id} '
+                        f'({consecutive_errors} consecutive error(s))'
                     )
                     await asyncio.sleep(delay)
 
         except asyncio.CancelledError:
-            logger.info('Worker cancelled')
+            logger.info(f'Worker for {group_id} cancelled')
         except Exception as e:
-            logger.error(f'Worker error: {e}')
+            logger.error(f'Worker error for {group_id}: {e}')
             raise
         finally:
-            self._worker_running = False
-            self._actively_processing = False
-            logger.info('Stopped stream worker')
+            self._worker_running[group_id] = False
+            self._actively_processing.discard(group_id)
+            logger.info(f'Stopped worker for {group_id}')
 
     async def _process_message(self, group_id: str, message_id: str, data: dict) -> bool:
         """Process a single message from the stream.
@@ -535,6 +355,7 @@ class RedisStreamsBackend(QueueBackend):
         if self._redis is None:
             raise RuntimeError('Queue backend not initialized')
 
+        stream_key = self._stream_key(group_id)
         episode = EpisodeMessage.from_stream_data(message_id, data)
 
         try:
@@ -551,11 +372,7 @@ class RedisStreamsBackend(QueueBackend):
                 entity_types=self._entity_types,
             )
 
-            await self._redis.xack(STREAM_KEY, self._config.consumer_group, message_id)
-            try:
-                await self._redis.xdel(STREAM_KEY, message_id)
-            except Exception:
-                pass  # Periodic XTRIM will clean up
+            await self._redis.xack(stream_key, self._config.consumer_group, message_id)
             logger.info(f'Successfully processed episode {episode.uuid}')
             return True
 
@@ -564,18 +381,25 @@ class RedisStreamsBackend(QueueBackend):
             # Don't ACK, don't re-queue — message stays pending for retry with backoff
             return False
 
-    async def _claim_abandoned(self) -> None:
-        """Claim abandoned messages from dead consumers."""
+    async def _claim_abandoned(self, group_id: str) -> None:
+        """Claim abandoned messages from dead consumers.
+
+        Uses XAUTOCLAIM to transfer ownership of messages that have been idle
+        too long (from crashed workers or previous instances). The messages
+        are claimed to this consumer and will be picked up by the main loop's
+        pending-read phase.
+        """
         if self._redis is None:
             return
 
+        stream_key = self._stream_key(group_id)
         total_claimed = 0
         cursor = '0'
 
         try:
             while True:
                 result = await self._redis.xautoclaim(
-                    STREAM_KEY,
+                    stream_key,
                     self._config.consumer_group,
                     self._consumer_name,
                     min_idle_time=self._config.claim_min_idle_ms,
@@ -595,100 +419,122 @@ class RedisStreamsBackend(QueueBackend):
                 cursor = next_cursor
 
             if total_claimed > 0:
-                logger.info(f'Claimed {total_claimed} abandoned messages')
+                logger.info(f'Claimed {total_claimed} abandoned messages for {group_id}')
 
         except redis.ResponseError as e:
             if 'NOGROUP' not in str(e):
-                logger.warning(f'Error claiming abandoned messages: {e}')
+                logger.warning(f'Error claiming abandoned messages for {group_id}: {e}')
 
     async def shutdown(self, timeout: float | None = None) -> None:
         """Graceful shutdown - wait for in-flight processing to complete."""
         timeout = timeout or self._config.shutdown_timeout
         self._shutting_down = True
 
-        # Cancel legacy drainer first
-        if self._drainer_task and not self._drainer_task.done():
-            self._drainer_task.cancel()
-            try:
-                await asyncio.wait_for(self._drainer_task, timeout=5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
+        if not self._worker_tasks:
+            logger.info('No workers to shut down')
+            return
 
-        if self._worker_task is None:
-            logger.info('No worker to shut down')
-        else:
-            logger.info('Shutting down worker...')
-            self._worker_task.cancel()
+        logger.info(f'Shutting down {len(self._worker_tasks)} workers...')
 
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(self._worker_task, return_exceptions=True),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f'Shutdown timeout ({timeout}s) reached, forcing termination')
+        for group_id, task in self._worker_tasks.items():
+            task.cancel()
+            logger.debug(f'Cancelled worker for {group_id}')
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self._worker_tasks.values(), return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f'Shutdown timeout ({timeout}s) reached, forcing termination')
 
         if self._redis is not None:
             await self._redis.close()
 
         logger.info('Redis Streams backend shutdown complete')
 
-    def get_queue_size(self) -> int:
+    def get_queue_size(self, group_id: str) -> int:
         """Get pending message count (approximate - requires async call for accuracy)."""
         return 0
 
+    async def get_pending_count_async(self, group_id: str) -> int:
+        """Get total unprocessed message count (pending + lag).
+
+        Returns the sum of:
+        - pending: messages delivered to a consumer but not yet acknowledged
+        - lag: messages in the stream not yet delivered to any consumer
+        """
+        if self._redis is None:
+            return 0
+
+        stream_key = self._stream_key(group_id)
+        try:
+            groups = await self._redis.xinfo_groups(stream_key)
+            for group in groups:
+                if group.get('name') != self._config.consumer_group:
+                    continue
+                pending = group.get('pending', 0) or 0
+                lag = group.get('lag', 0) or 0
+                return pending + lag
+            return 0
+        except Exception:
+            return 0
+
     async def get_status(self) -> tuple[int, int, list[dict]]:
-        """Get queue status: total pending, processing flag, and DLQ count."""
+        """Get total pending count, active workers, and per-group breakdown."""
         if self._redis is None:
             return 0, 0, []
 
         total_pending = 0
-        currently_processing = 1 if self._actively_processing else 0
-        groups_info: list[dict] = []
+        currently_processing = 0
+        groups_info = []
 
         try:
-            pending_count = 0
-            lag_count = 0
-            try:
-                groups = await self._redis.xinfo_groups(STREAM_KEY)
-                for group in groups:
-                    if group.get('name') != self._config.consumer_group:
-                        continue
-                    pending_count = group.get('pending', 0) or 0
-                    lag_count = group.get('lag', 0) or 0
-                    break
-            except redis.ResponseError:
-                # Stream might not exist yet — try XLEN as fallback
+            async for key in self._redis.scan_iter(match='graphiti:queue:*', count=100):
+                if isinstance(key, bytes):
+                    key = key.decode('utf-8')
+                if ':dlq' in key:
+                    continue
+
+                group_id = key.removeprefix('graphiti:queue:')
+                stream_key = self._stream_key(group_id)
+
+                pending_count = 0
+                lag_count = 0
                 try:
-                    total_pending = await self._redis.xlen(STREAM_KEY)
+                    groups = await self._redis.xinfo_groups(stream_key)
+                    for group in groups:
+                        if group.get('name') != self._config.consumer_group:
+                            continue
+                        pending_count = group.get('pending', 0) or 0
+                        lag_count = group.get('lag', 0) or 0
+                        break
                 except Exception:
                     pass
-                return total_pending, currently_processing, groups_info
 
-            total_pending = pending_count + lag_count
+                total_count = pending_count + lag_count
+                total_pending += total_count
 
-            # DLQ count
-            dlq_count = 0
-            try:
-                dlq_count = await self._redis.xlen(DLQ_KEY)
-            except Exception:
-                pass
+                is_active = group_id in self._actively_processing
+                if is_active:
+                    currently_processing += 1
 
-            groups_info.append({
-                'stream': STREAM_KEY,
-                'pending': pending_count,
-                'queued': lag_count,
-                'total': total_pending,
-                'dlq_count': dlq_count,
-                'processing': self._actively_processing,
-                'worker_running': self._worker_running,
-            })
-
+                if total_count > 0 or is_active:
+                    groups_info.append({
+                        'group_id': group_id,
+                        'pending': pending_count,
+                        'queued': lag_count,
+                        'total': total_count,
+                        'processing': is_active,
+                    })
         except Exception as e:
-            logger.error(f'Error getting queue status: {e}')
+            logger.error(f'Error getting all pending: {e}')
 
         return total_pending, currently_processing, groups_info
 
-    def is_worker_running(self) -> bool:
-        """Check if the worker is running."""
-        return self._worker_running
+    # Backward compatibility alias
+    get_all_pending_async = get_status
+
+    def is_worker_running(self, group_id: str) -> bool:
+        """Check if a worker is running for a group_id."""
+        return self._worker_running.get(group_id, False)

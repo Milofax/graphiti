@@ -296,10 +296,6 @@ class QueueConfigModel(BaseModel):
         default=30.0,
         description='Graceful shutdown timeout in seconds',
     )
-    throttle_seconds: float = Field(
-        default=0.0,
-        description='Seconds between legacy message processing (0 = no legacy drainer)',
-    )
 
 
 class GraphitiAppConfig(BaseModel):
