@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
+from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search.search_filters import SearchFilters
@@ -409,6 +410,19 @@ class GraphitiService:
         return self.client
 
 
+def _get_driver(client: Graphiti, group_id: str | None = None):
+    """Get driver, routing to the correct graph for the given group_id.
+
+    DB-neutral: Only clones the driver for FalkorDB (separate graphs per group_id).
+    For Neo4j and other providers, returns the original driver unchanged.
+    This matches the pattern used throughout graphiti_core/graphiti.py.
+    """
+    driver = client.driver
+    if group_id and driver.provider == GraphProvider.FALKORDB:
+        driver = driver.clone(database=group_id)
+    return driver
+
+
 @mcp.tool()
 async def add_memory(
     name: str,
@@ -634,11 +648,14 @@ async def search_memory_facts(
 
 
 @mcp.tool()
-async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
+async def delete_entity_edge(
+    uuid: str, group_id: str | None = None
+) -> SuccessResponse | ErrorResponse:
     """Delete an entity edge from the graph memory.
 
     Args:
         uuid: UUID of the entity edge to delete
+        group_id: Optional group ID for FalkorDB graph routing
     """
     global graphiti_service
 
@@ -647,11 +664,12 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
+        driver = _get_driver(client, group_id)
 
         # Get the entity edge by UUID
-        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+        entity_edge = await EntityEdge.get_by_uuid(driver, uuid)
         # Delete the edge using its delete method
-        await entity_edge.delete(client.driver)
+        await entity_edge.delete(driver)
         return SuccessResponse(message=f'Entity edge with UUID {uuid} deleted successfully')
     except Exception as e:
         error_msg = str(e)
@@ -660,11 +678,14 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
 
 
 @mcp.tool()
-async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
+async def delete_episode(
+    uuid: str, group_id: str | None = None
+) -> SuccessResponse | ErrorResponse:
     """Delete an episode from the graph memory.
 
     Args:
         uuid: UUID of the episode to delete
+        group_id: Optional group ID for FalkorDB graph routing
     """
     global graphiti_service
 
@@ -673,11 +694,12 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
+        driver = _get_driver(client, group_id)
 
         # Get the episodic node by UUID
-        episodic_node = await EpisodicNode.get_by_uuid(client.driver, uuid)
+        episodic_node = await EpisodicNode.get_by_uuid(driver, uuid)
         # Delete the node using its delete method
-        await episodic_node.delete(client.driver)
+        await episodic_node.delete(driver)
         return SuccessResponse(message=f'Episode with UUID {uuid} deleted successfully')
     except Exception as e:
         error_msg = str(e)
@@ -686,11 +708,14 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
 
 
 @mcp.tool()
-async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
+async def get_entity_edge(
+    uuid: str, group_id: str | None = None
+) -> dict[str, Any] | ErrorResponse:
     """Get an entity edge from the graph memory by its UUID.
 
     Args:
         uuid: UUID of the entity edge to retrieve
+        group_id: Optional group ID for FalkorDB graph routing
     """
     global graphiti_service
 
@@ -699,9 +724,10 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
+        driver = _get_driver(client, group_id)
 
         # Get the entity edge directly using the EntityEdge class method
-        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+        entity_edge = await EntityEdge.get_by_uuid(driver, uuid)
 
         # Use the format_fact_result function to serialize the edge
         # Return the Python dict directly - MCP will handle serialization
@@ -890,11 +916,14 @@ async def get_entity_types() -> EntityTypesResponse | ErrorResponse:
 
 
 @mcp.tool()
-async def get_entity_node(uuid: str) -> dict[str, Any] | ErrorResponse:
+async def get_entity_node(
+    uuid: str, group_id: str | None = None
+) -> dict[str, Any] | ErrorResponse:
     """Get an entity node from the graph memory by its UUID.
 
     Args:
         uuid: UUID of the entity node to retrieve
+        group_id: Optional group ID for FalkorDB graph routing
     """
     global graphiti_service
 
@@ -903,7 +932,8 @@ async def get_entity_node(uuid: str) -> dict[str, Any] | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
-        entity_node = await EntityNode.get_by_uuid(client.driver, uuid)
+        driver = _get_driver(client, group_id)
+        entity_node = await EntityNode.get_by_uuid(driver, uuid)
         return format_node_result(entity_node)
     except Exception as e:
         error_msg = str(e)
@@ -914,6 +944,7 @@ async def get_entity_node(uuid: str) -> dict[str, Any] | ErrorResponse:
 @mcp.tool()
 async def get_entity_edges_by_node(
     node_uuid: str,
+    group_id: str | None = None,
 ) -> FactSearchResponse | ErrorResponse:
     """Get all entity edges (facts/relationships) connected to a specific node.
 
@@ -924,6 +955,7 @@ async def get_entity_edges_by_node(
 
     Args:
         node_uuid: UUID of the entity node to get edges for
+        group_id: Optional group ID for FalkorDB graph routing
 
     Returns:
         List of all edges where this node is either source or target
@@ -935,9 +967,10 @@ async def get_entity_edges_by_node(
 
     try:
         client = await graphiti_service.get_client()
+        driver = _get_driver(client, group_id)
 
         # Get all edges connected to this node
-        edges = await EntityEdge.get_by_node_uuid(client.driver, node_uuid)
+        edges = await EntityEdge.get_by_node_uuid(driver, node_uuid)
 
         facts = [format_fact_result(edge) for edge in edges]
 
@@ -1098,6 +1131,7 @@ async def update_entity_node(
     summary: str | None = None,
     labels: list[str] | None = None,
     attributes: dict[str, Any] | None = None,
+    group_id: str | None = None,
 ) -> dict[str, Any] | ErrorResponse:
     """Update an existing entity node in the graph memory.
 
@@ -1111,6 +1145,7 @@ async def update_entity_node(
         summary: New summary for the entity (optional)
         labels: New labels for the entity, replaces existing labels (optional)
         attributes: Attributes to merge into existing attributes (optional)
+        group_id: Optional group ID for FalkorDB graph routing
 
     Returns:
         The updated entity node data, or an error response
@@ -1122,9 +1157,10 @@ async def update_entity_node(
 
     try:
         client = await graphiti_service.get_client()
+        driver = _get_driver(client, group_id)
 
         # Get the existing entity node
-        entity_node = await EntityNode.get_by_uuid(client.driver, uuid)
+        entity_node = await EntityNode.get_by_uuid(driver, uuid)
 
         # Track what was changed for logging
         changes = []
@@ -1157,7 +1193,7 @@ async def update_entity_node(
             await entity_node.generate_summary_embedding(client.embedder)
 
         # Save the updated node
-        await entity_node.save(client.driver)
+        await entity_node.save(driver)
 
         logger.info(f'Updated entity {uuid}: {", ".join(changes)}')
 
@@ -1175,6 +1211,7 @@ async def update_entity_edge(
     target_node_uuid: str | None = None,
     fact: str | None = None,
     name: str | None = None,
+    group_id: str | None = None,
 ) -> dict[str, Any] | ErrorResponse:
     """Update an existing entity edge (fact/relationship) in the graph memory.
 
@@ -1189,6 +1226,7 @@ async def update_entity_edge(
         target_node_uuid: New target node UUID (optional, must exist)
         fact: New fact text describing the relationship (optional)
         name: New relationship type name in UPPER_SNAKE_CASE (optional)
+        group_id: Optional group ID for FalkorDB graph routing
 
     Returns:
         The updated entity edge data, or an error response
@@ -1200,9 +1238,10 @@ async def update_entity_edge(
 
     try:
         client = await graphiti_service.get_client()
+        driver = _get_driver(client, group_id)
 
         # Get the existing edge
-        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+        entity_edge = await EntityEdge.get_by_uuid(driver, uuid)
 
         # Track changes and detect endpoint changes
         changes = []
@@ -1213,7 +1252,7 @@ async def update_entity_edge(
         # Validate and update source node
         if source_node_uuid is not None and source_node_uuid != entity_edge.source_node_uuid:
             # Verify the new source node exists
-            await EntityNode.get_by_uuid(client.driver, source_node_uuid)
+            await EntityNode.get_by_uuid(driver, source_node_uuid)
             entity_edge.source_node_uuid = source_node_uuid
             changes.append(f'source_node_uuid -> {source_node_uuid}')
             endpoints_changed = True
@@ -1221,7 +1260,7 @@ async def update_entity_edge(
         # Validate and update target node
         if target_node_uuid is not None and target_node_uuid != entity_edge.target_node_uuid:
             # Verify the new target node exists
-            await EntityNode.get_by_uuid(client.driver, target_node_uuid)
+            await EntityNode.get_by_uuid(driver, target_node_uuid)
             entity_edge.target_node_uuid = target_node_uuid
             changes.append(f'target_node_uuid -> {target_node_uuid}')
             endpoints_changed = True
@@ -1247,7 +1286,7 @@ async def update_entity_edge(
         # (Graph DBs don't allow changing edge endpoints in place)
         if endpoints_changed:
             # Delete the old edge using direct query to ensure it's removed
-            await client.driver.execute_query(
+            await driver.execute_query(
                 """
                 MATCH (:Entity {uuid: $source_uuid})-[e:RELATES_TO {uuid: $edge_uuid}]->(:Entity {uuid: $target_uuid})
                 DELETE e
@@ -1259,7 +1298,7 @@ async def update_entity_edge(
             logger.info(f'Deleted old edge {uuid} from {original_source} -> {original_target}')
 
         # Save the edge (creates new if endpoints changed, updates if not)
-        await entity_edge.save(client.driver)
+        await entity_edge.save(driver)
 
         logger.info(f'Updated entity edge {uuid}: {", ".join(changes)}')
 
@@ -1271,7 +1310,9 @@ async def update_entity_edge(
 
 
 @mcp.tool()
-async def delete_entity_node(uuid: str) -> SuccessResponse | ErrorResponse:
+async def delete_entity_node(
+    uuid: str, group_id: str | None = None
+) -> SuccessResponse | ErrorResponse:
     """Delete an entity node from the graph memory.
 
     IMPORTANT: This will permanently delete all edges connected to this node!
@@ -1283,6 +1324,7 @@ async def delete_entity_node(uuid: str) -> SuccessResponse | ErrorResponse:
 
     Args:
         uuid: UUID of the entity node to delete
+        group_id: Optional group ID for FalkorDB graph routing
     """
     global graphiti_service
 
@@ -1291,12 +1333,13 @@ async def delete_entity_node(uuid: str) -> SuccessResponse | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
+        driver = _get_driver(client, group_id)
 
         # First check how many edges are connected
-        edges = await EntityEdge.get_by_node_uuid(client.driver, uuid)
+        edges = await EntityEdge.get_by_node_uuid(driver, uuid)
 
         # Get the node to verify it exists and get its name
-        entity_node = await EntityNode.get_by_uuid(client.driver, uuid)
+        entity_node = await EntityNode.get_by_uuid(driver, uuid)
 
         if edges:
             logger.warning(
@@ -1306,10 +1349,10 @@ async def delete_entity_node(uuid: str) -> SuccessResponse | ErrorResponse:
 
         # Delete all connected edges first
         for edge in edges:
-            await edge.delete(client.driver)
+            await edge.delete(driver)
 
         # Delete the node
-        await entity_node.delete(client.driver)
+        await entity_node.delete(driver)
 
         return SuccessResponse(
             message=f'Deleted entity node "{entity_node.name}" ({uuid}) '
