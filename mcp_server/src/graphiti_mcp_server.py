@@ -1152,9 +1152,9 @@ async def update_entity_node(
 
         # Regenerate embeddings if name or summary changed
         if name is not None:
-            await entity_node.generate_name_embedding(client.llm_client.embedder)
+            await entity_node.generate_name_embedding(client.embedder)
         if summary is not None:
-            await entity_node.generate_summary_embedding(client.llm_client.embedder)
+            await entity_node.generate_summary_embedding(client.embedder)
 
         # Save the updated node
         await entity_node.save(client.driver)
@@ -1241,7 +1241,7 @@ async def update_entity_edge(
 
         # Regenerate fact embedding if fact changed
         if fact is not None:
-            await entity_edge.generate_embedding(client.llm_client.embedder)
+            await entity_edge.generate_embedding(client.embedder)
 
         # If endpoints changed, we must delete old edge first then create new one
         # (Graph DBs don't allow changing edge endpoints in place)
