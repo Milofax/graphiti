@@ -514,6 +514,94 @@ async def add_memory(
 
 
 @mcp.tool()
+async def create_entity_node(
+    name: str,
+    group_id: str | None = None,
+    entity_type: str = 'Entity',
+    summary: str = '',
+    attributes: dict[str, Any] | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Create a new entity node directly in the knowledge graph (without LLM extraction).
+
+    Use this to manually add a specific entity node. For bulk/natural-language ingestion,
+    use add_memory instead.
+
+    Args:
+        name: Name of the entity
+        group_id: Optional group/graph ID. Falls back to the configured default.
+        entity_type: Label/type of the entity, e.g. 'Weapon', 'Player' (default: 'Entity')
+        summary: Optional description of the entity
+        attributes: Optional additional attributes as a dict
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+        effective_group_id = group_id or config.graphiti.group_id
+
+        node = await client.create_entity(
+            name=name,
+            group_id=effective_group_id,
+            entity_type=entity_type,
+            summary=summary,
+            attributes=attributes,
+        )
+
+        return format_node_result(node)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error creating entity node: {error_msg}')
+        return ErrorResponse(error=f'Error creating entity node: {error_msg}')
+
+
+@mcp.tool()
+async def create_entity_edge(
+    source_node_uuid: str,
+    target_node_uuid: str,
+    name: str,
+    fact: str,
+    group_id: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Create a new edge (relationship) between two entity nodes directly in the knowledge graph.
+
+    Use this to manually add a specific relationship. For bulk/natural-language ingestion,
+    use add_memory instead.
+
+    Args:
+        source_node_uuid: UUID of the source entity node
+        target_node_uuid: UUID of the target entity node
+        name: Relationship type in UPPER_SNAKE_CASE, e.g. 'HAS_WEAPON'
+        fact: Fact text describing the relationship
+        group_id: Optional group/graph ID. Falls back to the configured default.
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+        effective_group_id = group_id or config.graphiti.group_id
+
+        edge = await client.create_edge(
+            source_node_uuid=source_node_uuid,
+            target_node_uuid=target_node_uuid,
+            name=name,
+            fact=fact,
+            group_id=effective_group_id,
+        )
+
+        return format_fact_result(edge)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error creating entity edge: {error_msg}')
+        return ErrorResponse(error=f'Error creating entity edge: {error_msg}')
+
+
+@mcp.tool()
 async def search_nodes(
     query: str,
     group_ids: list[str] | None = None,

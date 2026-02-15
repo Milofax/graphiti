@@ -138,6 +138,8 @@ def mock_graphiti_client(mock_driver, mock_embedder, mock_entity_node, mock_enti
     client.get_episode = AsyncMock()
     client.search_ = AsyncMock()
     client.search = AsyncMock(return_value=[])
+    client.create_entity = AsyncMock(return_value=mock_entity_node)
+    client.create_edge = AsyncMock(return_value=mock_entity_edge)
     client.get_entities_by_group_id = AsyncMock(return_value=[])
     client.get_edges_by_group_id = AsyncMock(return_value=[])
     return client
@@ -193,6 +195,8 @@ class TestImports:
 
         tools = [
             'add_memory',
+            'create_entity_node',
+            'create_entity_edge',
             'search_nodes',
             'search_memory_facts',
             'get_episodes',
@@ -287,6 +291,20 @@ class TestServiceNoneErrors:
         from graphiti_mcp_server import add_memory
 
         result = await add_memory(name='test', episode_body='test')
+        assert 'error' in result
+
+    async def test_create_entity_node_error(self):
+        from graphiti_mcp_server import create_entity_node
+
+        result = await create_entity_node(name='TestNode')
+        assert 'error' in result
+
+    async def test_create_entity_edge_error(self):
+        from graphiti_mcp_server import create_entity_edge
+
+        result = await create_entity_edge(
+            source_node_uuid='src', target_node_uuid='tgt', name='REL', fact='test'
+        )
         assert 'error' in result
 
     async def test_search_nodes_error(self):
@@ -425,6 +443,45 @@ class TestHappyPath:
         result = await add_memory(name='test', episode_body='test body')
         assert 'error' not in result
         assert 'message' in result
+
+    async def test_create_entity_node(self, mock_graphiti_client):
+        from graphiti_mcp_server import create_entity_node
+
+        result = await create_entity_node(name='TestNode', entity_type='Weapon', summary='A sword')
+        assert 'error' not in result
+        assert result['name'] == 'TestEntity'
+        mock_graphiti_client.create_entity.assert_awaited_once()
+
+    async def test_create_entity_edge(self, mock_graphiti_client):
+        from graphiti_mcp_server import create_entity_edge
+
+        result = await create_entity_edge(
+            source_node_uuid='src-uuid',
+            target_node_uuid='tgt-uuid',
+            name='HAS_WEAPON',
+            fact='Player has a sword',
+        )
+        assert 'error' not in result
+        assert result['name'] == 'RELATES_TO'
+        mock_graphiti_client.create_edge.assert_awaited_once()
+
+    async def test_create_entity_node_default_group_id(self, mock_graphiti_client):
+        from graphiti_mcp_server import create_entity_node
+
+        await create_entity_node(name='TestNode')
+        mock_graphiti_client.create_entity.assert_awaited_once()
+        call_kwargs = mock_graphiti_client.create_entity.call_args.kwargs
+        assert call_kwargs['group_id'] == 'test-group'
+
+    async def test_create_entity_edge_default_group_id(self, mock_graphiti_client):
+        from graphiti_mcp_server import create_entity_edge
+
+        await create_entity_edge(
+            source_node_uuid='src', target_node_uuid='tgt', name='REL', fact='test'
+        )
+        mock_graphiti_client.create_edge.assert_awaited_once()
+        call_kwargs = mock_graphiti_client.create_edge.call_args.kwargs
+        assert call_kwargs['group_id'] == 'test-group'
 
     async def test_search_nodes(self, mock_graphiti_client):
         from graphiti_mcp_server import search_nodes
