@@ -197,9 +197,11 @@ async def edge_fulltext_search(
     if fuzzy_query == '':
         return []
 
+    # Use startNode(e)/endNode(e) instead of MATCH to avoid All Node Scan
+    # planner bug in FalkorDB (Issue #943). This is also more efficient for Neo4j.
     match_query = """
-    YIELD relationship AS rel, score
-    MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
+    YIELD relationship AS e, score
+    WITH startNode(e) AS n, endNode(e) AS m, e, score
     """
     if driver.provider == GraphProvider.KUZU:
         match_query = """

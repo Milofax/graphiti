@@ -118,8 +118,10 @@ STOPWORDS = [
     'viel', 'viele', 'mehr', 'ganz', 'etwa', 'dabei',
 ]
 
-# Safety net: cap OR-terms to prevent fulltext explosion on long queries
-MAX_FULLTEXT_TERMS = 10
+# Safety net: cap OR-terms to prevent fulltext explosion on long queries.
+# RediSearch OR-queries (term1 | term2 | ... | termN) scale linearly with term count —
+# each term traverses a separate posting list and all matches get BM25-scored.
+MAX_FULLTEXT_TERMS = 5
 
 
 class FalkorDriverSession(GraphDriverSession):
@@ -217,11 +219,20 @@ class FalkorDriver(GraphDriver):
     async def execute_query(self, cypher_query_, **kwargs: Any):
         graph = self._get_graph(self._database)
 
+        # Honor routing_='r' hint: use GRAPH.RO_QUERY for read-only queries.
+        # This enables concurrent reads (shared lock) instead of exclusive write locks.
+        # Neo4j uses routing_ for read-replica routing; FalkorDB uses it for RO_QUERY.
+        routing = kwargs.pop('routing_', None)
+        use_ro_query = routing == 'r'
+
         # Convert datetime objects to ISO strings (FalkorDB does not support datetime objects directly)
         params = convert_datetimes_to_strings(dict(kwargs))
 
         try:
-            result = await graph.query(cypher_query_, params)  # type: ignore[reportUnknownArgumentType]
+            if use_ro_query:
+                result = await graph.ro_query(cypher_query_, params)  # type: ignore[reportUnknownArgumentType]
+            else:
+                result = await graph.query(cypher_query_, params)  # type: ignore[reportUnknownArgumentType]
         except Exception as e:
             if 'already indexed' in str(e):
                 # check if index already exists
