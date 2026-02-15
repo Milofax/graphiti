@@ -64,6 +64,7 @@ def create_queue_backend(config: 'GraphitiConfig') -> QueueBackend:
             claim_min_idle_ms=q.claim_min_idle_ms,
             max_retries=q.max_retries,
             shutdown_timeout=q.shutdown_timeout,
+            throttle_seconds=q.throttle_seconds,
         )
         logger.info('Using Redis Streams backend')
         return RedisStreamsBackend(config=redis_cfg)

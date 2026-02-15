@@ -1,20 +1,32 @@
-"""Tests for Redis Streams queue robustness fixes.
+"""Tests for Redis Streams queue robustness.
 
-TDD — these tests are written BEFORE the implementation.
-They verify:
+Verifies:
 1. Stable consumer name (env var instead of hostname+pid)
 2. XDEL after XACK (stream cleanup per message)
-3. Periodic XTRIM (safety net for stream growth)
-4. Max-retries via delivery count (discard zombie messages)
+3. Periodic XTRIM with maxlen=5000
+4. DLQ: failed messages moved to DLQ instead of discarded
+5. Single stream architecture (no per-group streams)
+6. Legacy drainer: throttled processing of migrated messages
 """
 
 import asyncio
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import redis.asyncio as aioredis
 
-from services.queue_redis import RedisQueueConfig, RedisStreamsBackend
+from services.queue_redis import (
+    DLQ_KEY,
+    LEGACY_KEY,
+    STREAM_KEY,
+    THROTTLE_HOUR_END,
+    THROTTLE_HOUR_START,
+    XTRIM_MAXLEN,
+    RedisQueueConfig,
+    RedisStreamsBackend,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +51,7 @@ def mock_redis():
     r.xautoclaim = AsyncMock(return_value=('0-0', []))
     r.xpending_range = AsyncMock(return_value=[])
     r.xinfo_groups = AsyncMock(return_value=[])
+    r.xlen = AsyncMock(return_value=0)
     r.close = AsyncMock()
     r.scan_iter = MagicMock(return_value=AsyncIterEmpty())
     return r
@@ -69,7 +82,6 @@ class TestStableConsumerName:
     def test_default_consumer_name_is_worker_0(self, config):
         """Without env var, consumer name defaults to 'worker_0'."""
         with patch.dict(os.environ, {}, clear=False):
-            # Remove env var if present
             os.environ.pop('GRAPHITI_CONSUMER_NAME', None)
             backend = RedisStreamsBackend(config=config)
             assert backend._consumer_name == 'worker_0'
@@ -89,7 +101,7 @@ class TestStableConsumerName:
             assert socket.gethostname() not in backend._consumer_name
 
     def test_consumer_name_does_not_contain_pid(self, config):
-        """Consumer name must NOT contain PID (always 1 in Docker, but still volatile)."""
+        """Consumer name must NOT contain PID."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('GRAPHITI_CONSUMER_NAME', None)
             backend = RedisStreamsBackend(config=config)
@@ -97,7 +109,7 @@ class TestStableConsumerName:
 
 
 # ===========================================================================
-# 2. XDEL after XACK
+# 2. XDEL after XACK (single stream)
 # ===========================================================================
 
 class TestXdelAfterXack:
@@ -107,7 +119,7 @@ class TestXdelAfterXack:
     async def test_xdel_called_after_successful_processing(
         self, config, mock_redis, mock_graphiti
     ):
-        """After XACK, XDEL must be called to remove the message from the stream."""
+        """After XACK, XDEL must be called on the single stream."""
         backend = RedisStreamsBackend(config=config)
         backend._redis = mock_redis
         backend._graphiti_client = mock_graphiti
@@ -123,8 +135,8 @@ class TestXdelAfterXack:
         })
 
         assert success is True
-        mock_redis.xack.assert_called_once()
-        mock_redis.xdel.assert_called_once_with('graphiti:queue:main', '1000-0')
+        mock_redis.xack.assert_called_once_with(STREAM_KEY, config.consumer_group, '1000-0')
+        mock_redis.xdel.assert_called_once_with(STREAM_KEY, '1000-0')
 
     @pytest.mark.asyncio
     async def test_xdel_not_called_on_failure(
@@ -155,7 +167,7 @@ class TestXdelAfterXack:
     async def test_xdel_failure_does_not_break_processing(
         self, config, mock_redis, mock_graphiti
     ):
-        """If XDEL fails, processing should still return True (XTRIM will clean up)."""
+        """If XDEL fails, processing should still return True."""
         mock_redis.xdel = AsyncMock(side_effect=Exception('Redis error'))
 
         backend = RedisStreamsBackend(config=config)
@@ -177,37 +189,32 @@ class TestXdelAfterXack:
 
 
 # ===========================================================================
-# 3. Periodic XTRIM
+# 3. Periodic XTRIM with maxlen=5000
 # ===========================================================================
 
 class TestPeriodicXtrim:
-    """Maintenance cycle must XTRIM streams as safety net."""
+    """Maintenance cycle must XTRIM the single stream."""
 
     @pytest.mark.asyncio
     async def test_xtrim_called_during_maintenance(self, config, mock_redis, mock_graphiti):
-        """XTRIM should be called alongside _claim_abandoned in maintenance cycle."""
+        """XTRIM should be called with maxlen=5000 during maintenance."""
         backend = RedisStreamsBackend(config=config)
         backend._redis = mock_redis
         backend._graphiti_client = mock_graphiti
 
-        # Let the worker run for enough iterations to trigger maintenance.
-        # Each loop iteration does 2 xreadgroup calls (Phase 1 pending + Phase 2 new),
-        # but reclaim_counter increments once per loop iteration.
         iteration = 0
-        RECLAIM_EVERY = 12  # Must match constant in code
+        RECLAIM_EVERY = 12
 
         async def fake_xreadgroup(*args, **kwargs):
             nonlocal iteration
             iteration += 1
-            # Need RECLAIM_EVERY * 2 calls (2 per loop) + margin
             if iteration > RECLAIM_EVERY * 2 + 4:
                 backend._shutting_down = True
             return []
 
         mock_redis.xreadgroup = fake_xreadgroup
 
-        await backend._ensure_worker_running('main')
-        # Wait for worker to run through maintenance cycle
+        backend._start_worker()
         for _ in range(50):
             if backend._shutting_down:
                 break
@@ -215,25 +222,26 @@ class TestPeriodicXtrim:
         await asyncio.sleep(0.1)
 
         mock_redis.xtrim.assert_called()
-        # Verify approximate trimming to ~100
         call_args = mock_redis.xtrim.call_args
         assert call_args is not None
-        # xtrim(stream_key, maxlen=100, approximate=True)
-        assert call_args.kwargs.get('maxlen', call_args[1].get('maxlen', None)) == 100
+        # Verify stream key is the single stream
+        assert call_args[0][0] == STREAM_KEY
+        # Verify maxlen=5000
+        assert call_args.kwargs.get('maxlen', call_args[1].get('maxlen', None)) == XTRIM_MAXLEN
 
 
 # ===========================================================================
-# 4. Max-retries via delivery count
+# 4. DLQ instead of discard
 # ===========================================================================
 
-class TestMaxRetriesEnforcement:
-    """Messages exceeding max_retries must be discarded, not retried forever."""
+class TestDLQEnforcement:
+    """Messages exceeding max_retries must be moved to DLQ, not discarded."""
 
     @pytest.mark.asyncio
-    async def test_message_discarded_after_max_retries(
+    async def test_message_moved_to_dlq_after_max_retries(
         self, config, mock_redis, mock_graphiti
     ):
-        """Message with delivery count > max_retries is ACK'd + DEL'd without processing."""
+        """Message with delivery count > max_retries is moved to DLQ."""
         backend = RedisStreamsBackend(config=config)
         backend._redis = mock_redis
         backend._graphiti_client = mock_graphiti
@@ -249,7 +257,6 @@ class TestMaxRetriesEnforcement:
             'retry_count': '0',
         }
 
-        # Phase 1 returns pending message with high delivery count
         phase1_called = False
         async def fake_xreadgroup(*args, **kwargs):
             nonlocal phase1_called
@@ -258,16 +265,13 @@ class TestMaxRetriesEnforcement:
             stream_id = streams[stream_key]
 
             if stream_id == '0' and not phase1_called:
-                # Phase 1: return pending message
                 phase1_called = True
                 return [(stream_key, [(msg_id, msg_data)])]
-            # After discard, shutdown
             backend._shutting_down = True
             return []
 
         mock_redis.xreadgroup = fake_xreadgroup
 
-        # xpending_range returns delivery count > max_retries (3)
         mock_redis.xpending_range = AsyncMock(return_value=[{
             'message_id': msg_id,
             'consumer': 'worker_0',
@@ -275,17 +279,26 @@ class TestMaxRetriesEnforcement:
             'times_delivered': 5,  # > max_retries=3
         }])
 
-        await backend._ensure_worker_running('main')
+        backend._start_worker()
         for _ in range(50):
             if backend._shutting_down:
                 break
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.1)
 
-        # Message should be ACK'd and DEL'd
+        # Message should be added to DLQ
+        dlq_calls = [c for c in mock_redis.xadd.call_args_list if c[0][0] == DLQ_KEY]
+        assert len(dlq_calls) == 1
+        dlq_data = dlq_calls[0][0][1]
+        assert dlq_data['group_id'] == 'main'
+        assert dlq_data['name'] == 'Zombie Episode'
+        assert dlq_data['original_stream_id'] == msg_id
+        assert dlq_data['times_delivered'] == '5'
+        assert 'moved_to_dlq_at' in dlq_data
+
+        # Message should be ACK'd from main stream
         mock_redis.xack.assert_called()
-        mock_redis.xdel.assert_called()
-        # But NOT processed through graphiti
+        # NOT processed through graphiti
         mock_graphiti.add_episode.assert_not_called()
 
     @pytest.mark.asyncio
@@ -323,7 +336,6 @@ class TestMaxRetriesEnforcement:
 
         mock_redis.xreadgroup = fake_xreadgroup
 
-        # delivery count within limit
         mock_redis.xpending_range = AsyncMock(return_value=[{
             'message_id': msg_id,
             'consumer': 'worker_0',
@@ -331,14 +343,13 @@ class TestMaxRetriesEnforcement:
             'times_delivered': 2,  # <= max_retries=3
         }])
 
-        await backend._ensure_worker_running('main')
+        backend._start_worker()
         for _ in range(50):
             if backend._shutting_down:
                 break
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.1)
 
-        # Message SHOULD be processed
         mock_graphiti.add_episode.assert_called_once()
 
     @pytest.mark.asyncio
@@ -377,12 +388,160 @@ class TestMaxRetriesEnforcement:
         mock_redis.xreadgroup = fake_xreadgroup
         mock_redis.xpending_range = AsyncMock(side_effect=Exception('Redis error'))
 
-        await backend._ensure_worker_running('main')
+        backend._start_worker()
         for _ in range(50):
             if backend._shutting_down:
                 break
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.1)
 
-        # Message should still be processed (graceful degradation)
         mock_graphiti.add_episode.assert_called_once()
+
+
+# ===========================================================================
+# 5. Single stream architecture
+# ===========================================================================
+
+class TestSingleStreamArchitecture:
+    """All operations use the single stream, not per-group streams."""
+
+    @pytest.mark.asyncio
+    async def test_add_episode_uses_single_stream(self, config, mock_redis, mock_graphiti):
+        """add_episode always writes to STREAM_KEY regardless of group_id."""
+        backend = RedisStreamsBackend(config=config)
+        backend._redis = mock_redis
+        backend._graphiti_client = mock_graphiti
+        backend._shutting_down = True
+
+        await backend.add_episode(
+            group_id='some-random-group',
+            name='Test',
+            content='Content',
+            source_description='test',
+            episode_type='text',
+            entity_types=None,
+            uuid='uuid-1',
+        )
+
+        call_args = mock_redis.xadd.call_args
+        assert call_args[0][0] == STREAM_KEY
+
+    @pytest.mark.asyncio
+    async def test_process_message_acks_on_single_stream(
+        self, config, mock_redis, mock_graphiti
+    ):
+        """_process_message ACKs on the single stream."""
+        backend = RedisStreamsBackend(config=config)
+        backend._redis = mock_redis
+        backend._graphiti_client = mock_graphiti
+
+        await backend._process_message('any-group', '1000-0', {
+            'group_id': 'any-group',
+            'name': 'Test',
+            'content': 'Content',
+            'source_description': 'test',
+            'episode_type': 'text',
+            'uuid': 'uuid-1',
+            'retry_count': '0',
+        })
+
+        mock_redis.xack.assert_called_once_with(
+            STREAM_KEY, config.consumer_group, '1000-0'
+        )
+
+    def test_is_worker_running_returns_bool(self, config):
+        """is_worker_running returns a simple bool, not per-group dict."""
+        backend = RedisStreamsBackend(config=config)
+        assert backend.is_worker_running() is False
+        backend._worker_running = True
+        assert backend.is_worker_running() is True
+
+    def test_get_queue_size_returns_zero(self, config):
+        """get_queue_size returns 0 (approximate, async needed for accuracy)."""
+        backend = RedisStreamsBackend(config=config)
+        assert backend.get_queue_size() == 0
+
+
+# ===========================================================================
+# 6. Legacy drainer
+# ===========================================================================
+
+class TestLegacyDrainer:
+    """Legacy messages are migrated to a separate list and drained with throttle."""
+
+    def test_default_throttle_is_zero(self):
+        """Default throttle_seconds must be 0.0 (no drainer)."""
+        config = RedisQueueConfig()
+        assert config.throttle_seconds == 0.0
+
+    def test_throttle_config_stored(self):
+        """throttle_seconds value is stored in config."""
+        config = RedisQueueConfig(throttle_seconds=420.0)
+        assert config.throttle_seconds == 420.0
+
+    def test_time_window_constants(self):
+        """Time window constants must be 9:00-22:00."""
+        assert THROTTLE_HOUR_START == 9
+        assert THROTTLE_HOUR_END == 22
+
+    def test_legacy_key_constant(self):
+        """LEGACY_KEY must be 'graphiti:queue:legacy'."""
+        assert LEGACY_KEY == 'graphiti:queue:legacy'
+
+    @pytest.mark.asyncio
+    async def test_migration_uses_rpush(self, mock_redis, mock_graphiti):
+        """Migration must write legacy messages to LEGACY_KEY via RPUSH, not XADD to main stream."""
+        config = RedisQueueConfig(throttle_seconds=420.0)
+        backend = RedisStreamsBackend(config=config)
+        backend._redis = mock_redis
+        backend._graphiti_client = mock_graphiti
+
+        # Set up mock to return one legacy stream with one unprocessed message
+        legacy_key = 'graphiti:queue:test-group'
+        msg_data = {
+            'group_id': 'test-group',
+            'name': 'Legacy Episode',
+            'content': 'Legacy content',
+            'source_description': 'test',
+            'episode_type': 'text',
+            'uuid': 'legacy-uuid',
+            'retry_count': '0',
+        }
+
+        class AsyncIterLegacy:
+            def __init__(self):
+                self._items = [legacy_key]
+                self._idx = 0
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                if self._idx >= len(self._items):
+                    raise StopAsyncIteration
+                val = self._items[self._idx]
+                self._idx += 1
+                return val
+
+        mock_redis.scan_iter = MagicMock(return_value=AsyncIterLegacy())
+        mock_redis.xrange = AsyncMock(return_value=[('1000-0', msg_data)])
+        mock_redis.xinfo_groups = AsyncMock(side_effect=aioredis.ResponseError('NOGROUP'))
+        mock_redis.delete = AsyncMock()
+        mock_redis.rpush = AsyncMock()
+        mock_redis.llen = AsyncMock(return_value=0)
+
+        await backend._migrate_legacy_streams()
+
+        # RPUSH to legacy list — NOT xadd to main stream
+        mock_redis.rpush.assert_called_once()
+        rpush_args = mock_redis.rpush.call_args[0]
+        assert rpush_args[0] == LEGACY_KEY
+        pushed_data = json.loads(rpush_args[1])
+        assert pushed_data['group_id'] == 'test-group'
+        assert pushed_data['name'] == 'Legacy Episode'
+
+        # xadd should NOT be called for migrated messages
+        # (it may be called for DLQ or other purposes, but not for migration)
+        xadd_to_main = [
+            c for c in mock_redis.xadd.call_args_list
+            if c[0][0] == STREAM_KEY
+        ]
+        assert len(xadd_to_main) == 0, 'Migration should not XADD to main stream'
