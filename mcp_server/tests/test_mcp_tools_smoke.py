@@ -140,6 +140,8 @@ def mock_graphiti_client(mock_driver, mock_embedder, mock_entity_node, mock_enti
     client.search = AsyncMock(return_value=[])
     client.create_entity = AsyncMock(return_value=mock_entity_node)
     client.create_edge = AsyncMock(return_value=mock_entity_edge)
+    client.update_entity = AsyncMock(return_value=mock_entity_node)
+    client.update_edge = AsyncMock(return_value=mock_entity_edge)
     client.get_entities_by_group_id = AsyncMock(return_value=[])
     client.get_edges_by_group_id = AsyncMock(return_value=[])
     return client
@@ -576,29 +578,19 @@ class TestHappyPath:
         result = await list_edges()
         assert 'error' not in result
 
-    @patch.object(EntityNode, 'get_by_uuid', new_callable=AsyncMock)
-    async def test_update_entity_node(self, mock_get, mock_entity_node, mock_graphiti_client):
+    async def test_update_entity_node(self, mock_graphiti_client):
         from graphiti_mcp_server import update_entity_node
 
-        mock_get.return_value = mock_entity_node
         result = await update_entity_node(uuid='test-uuid-node', name='NewName')
         assert 'error' not in result
-        mock_entity_node.generate_name_embedding.assert_awaited_once_with(
-            mock_graphiti_client.embedder
-        )
-        mock_entity_node.save.assert_awaited_once()
+        mock_graphiti_client.update_entity.assert_awaited_once()
 
-    @patch.object(EntityEdge, 'get_by_uuid', new_callable=AsyncMock)
-    async def test_update_entity_edge(self, mock_get, mock_entity_edge, mock_graphiti_client):
+    async def test_update_entity_edge(self, mock_graphiti_client):
         from graphiti_mcp_server import update_entity_edge
 
-        mock_get.return_value = mock_entity_edge
         result = await update_entity_edge(uuid='test-uuid-edge', fact='Updated fact')
         assert 'error' not in result
-        mock_entity_edge.generate_embedding.assert_awaited_once_with(
-            mock_graphiti_client.embedder
-        )
-        mock_entity_edge.save.assert_awaited_once()
+        mock_graphiti_client.update_edge.assert_awaited_once()
 
     @patch.object(EntityEdge, 'get_by_node_uuid', new_callable=AsyncMock)
     @patch.object(EntityNode, 'get_by_uuid', new_callable=AsyncMock)
@@ -706,25 +698,19 @@ class TestFalkorDBGroupIdRouting:
         await get_entity_edges_by_node(node_uuid='test-uuid', group_id='TankWars')
         mock_falkor_driver.clone.assert_called_once_with(database='TankWars')
 
-    @patch.object(EntityNode, 'get_by_uuid', new_callable=AsyncMock)
-    async def test_update_entity_node_clones(
-        self, mock_get, mock_entity_node, mock_falkor_driver
-    ):
+    async def test_update_entity_node_passes_group_id(self, mock_graphiti_client):
         from graphiti_mcp_server import update_entity_node
 
-        mock_get.return_value = mock_entity_node
         await update_entity_node(uuid='test-uuid', name='NewName', group_id='TankWars')
-        mock_falkor_driver.clone.assert_called_once_with(database='TankWars')
+        call_kwargs = mock_graphiti_client.update_entity.call_args.kwargs
+        assert call_kwargs['group_id'] == 'TankWars'
 
-    @patch.object(EntityEdge, 'get_by_uuid', new_callable=AsyncMock)
-    async def test_update_entity_edge_clones(
-        self, mock_get, mock_entity_edge, mock_falkor_driver
-    ):
+    async def test_update_entity_edge_passes_group_id(self, mock_graphiti_client):
         from graphiti_mcp_server import update_entity_edge
 
-        mock_get.return_value = mock_entity_edge
         await update_entity_edge(uuid='test-uuid', fact='New fact', group_id='TankWars')
-        mock_falkor_driver.clone.assert_called_once_with(database='TankWars')
+        call_kwargs = mock_graphiti_client.update_edge.call_args.kwargs
+        assert call_kwargs['group_id'] == 'TankWars'
 
     @patch.object(EntityEdge, 'get_by_node_uuid', new_callable=AsyncMock)
     @patch.object(EntityNode, 'get_by_uuid', new_callable=AsyncMock)
