@@ -38,7 +38,7 @@ from models.response_types import (
 from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
 from services.entity_type_service import EntityTypeService
 from services.queue_service import QueueBackend, create_queue_backend
-from utils.formatting import format_fact_result
+from utils.formatting import format_fact_result, format_node_result
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
