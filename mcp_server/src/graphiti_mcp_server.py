@@ -655,7 +655,7 @@ async def delete_entity_edge(
 
     Args:
         uuid: UUID of the entity edge to delete
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
     """
     global graphiti_service
 
@@ -685,7 +685,7 @@ async def delete_episode(
 
     Args:
         uuid: UUID of the episode to delete
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
     """
     global graphiti_service
 
@@ -715,7 +715,7 @@ async def get_entity_edge(
 
     Args:
         uuid: UUID of the entity edge to retrieve
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
     """
     global graphiti_service
 
@@ -923,7 +923,7 @@ async def get_entity_node(
 
     Args:
         uuid: UUID of the entity node to retrieve
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
     """
     global graphiti_service
 
@@ -955,7 +955,7 @@ async def get_entity_edges_by_node(
 
     Args:
         node_uuid: UUID of the entity node to get edges for
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
 
     Returns:
         List of all edges where this node is either source or target
@@ -1145,7 +1145,7 @@ async def update_entity_node(
         summary: New summary for the entity (optional)
         labels: New labels for the entity, replaces existing labels (optional)
         attributes: Attributes to merge into existing attributes (optional)
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
 
     Returns:
         The updated entity node data, or an error response
@@ -1226,7 +1226,7 @@ async def update_entity_edge(
         target_node_uuid: New target node UUID (optional, must exist)
         fact: New fact text describing the relationship (optional)
         name: New relationship type name in UPPER_SNAKE_CASE (optional)
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
 
     Returns:
         The updated entity edge data, or an error response
@@ -1324,7 +1324,7 @@ async def delete_entity_node(
 
     Args:
         uuid: UUID of the entity node to delete
-        group_id: Optional group ID for FalkorDB graph routing
+        group_id: The group/graph this entity belongs to. Always provide this when you know the group. If you get a 'not found' error, retry with the correct group_id.
     """
     global graphiti_service
 
