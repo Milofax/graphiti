@@ -396,14 +396,11 @@ class FalkorDriver(GraphDriver):
         - AND is implicit with space: (@group_id:value) (text)
         - OR uses pipe within parentheses: (@group_id:value1|value2)
         """
-        if group_ids is None or len(group_ids) == 0:
-            group_filter = ''
-        else:
-            # Escape group_ids with quotes to prevent RediSearch syntax errors
-            # with reserved words like "main" or special characters like hyphens
-            escaped_group_ids = [f'"{gid}"' for gid in group_ids]
-            group_values = '|'.join(escaped_group_ids)
-            group_filter = f'(@group_id:{group_values})'
+        # FalkorDB uses separate Redis graphs per group_id.
+        # The @handle_multiple_group_ids decorator already clones the driver
+        # to the correct graph, so @group_id filtering in the fulltext query
+        # is unnecessary and fails (group_id is not in the fulltext index).
+        group_filter = ''
 
         sanitized_query = self.sanitize(query)
 

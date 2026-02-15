@@ -160,12 +160,12 @@ class TestMaxFulltextTerms:
                 f'Timeout query still produces {len(terms)} terms (max {MAX_FULLTEXT_TERMS})'
             )
 
-    def test_build_fulltext_query_group_id_escaping(self):
-        """group_ids are escaped with quotes in the RediSearch query."""
+    def test_build_fulltext_query_ignores_group_ids(self):
+        """FalkorDB uses separate graphs per group_id, so group_id filter is not in fulltext query."""
         query = 'test query'
         result = self.driver.build_fulltext_query(query, group_ids=['main', 'my-project'])
-        # Group filter should escape with quotes: (@group_id:"main"|"my-project")
-        assert '(@group_id:"main"|"my-project")' in result
+        # FalkorDB: no @group_id filter (handled by separate graphs + decorator)
+        assert '@group_id' not in result
         # Query terms should still be present
         terms = _extract_terms(result)
         assert 'test' in terms
