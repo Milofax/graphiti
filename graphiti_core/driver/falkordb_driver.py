@@ -34,94 +34,42 @@ else:
         ) from None
 
 from graphiti_core.driver.driver import GraphDriver, GraphDriverSession, GraphProvider
+from graphiti_core.driver.falkordb import MAX_FULLTEXT_TERMS as MAX_FULLTEXT_TERMS
+from graphiti_core.driver.falkordb import STOPWORDS as STOPWORDS
+from graphiti_core.driver.falkordb.operations.community_edge_ops import (
+    FalkorCommunityEdgeOperations,
+)
+from graphiti_core.driver.falkordb.operations.community_node_ops import (
+    FalkorCommunityNodeOperations,
+)
+from graphiti_core.driver.falkordb.operations.entity_edge_ops import FalkorEntityEdgeOperations
+from graphiti_core.driver.falkordb.operations.entity_node_ops import FalkorEntityNodeOperations
+from graphiti_core.driver.falkordb.operations.episode_node_ops import FalkorEpisodeNodeOperations
+from graphiti_core.driver.falkordb.operations.episodic_edge_ops import FalkorEpisodicEdgeOperations
+from graphiti_core.driver.falkordb.operations.graph_ops import FalkorGraphMaintenanceOperations
+from graphiti_core.driver.falkordb.operations.has_episode_edge_ops import (
+    FalkorHasEpisodeEdgeOperations,
+)
+from graphiti_core.driver.falkordb.operations.next_episode_edge_ops import (
+    FalkorNextEpisodeEdgeOperations,
+)
+from graphiti_core.driver.falkordb.operations.saga_node_ops import FalkorSagaNodeOperations
+from graphiti_core.driver.falkordb.operations.search_ops import FalkorSearchOperations
+from graphiti_core.driver.operations.community_edge_ops import CommunityEdgeOperations
+from graphiti_core.driver.operations.community_node_ops import CommunityNodeOperations
+from graphiti_core.driver.operations.entity_edge_ops import EntityEdgeOperations
+from graphiti_core.driver.operations.entity_node_ops import EntityNodeOperations
+from graphiti_core.driver.operations.episode_node_ops import EpisodeNodeOperations
+from graphiti_core.driver.operations.episodic_edge_ops import EpisodicEdgeOperations
+from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
+from graphiti_core.driver.operations.has_episode_edge_ops import HasEpisodeEdgeOperations
+from graphiti_core.driver.operations.next_episode_edge_ops import NextEpisodeEdgeOperations
+from graphiti_core.driver.operations.saga_node_ops import SagaNodeOperations
+from graphiti_core.driver.operations.search_ops import SearchOperations
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
 from graphiti_core.utils.datetime_utils import convert_datetimes_to_strings
 
 logger = logging.getLogger(__name__)
-
-STOPWORDS = [
-    # === ENGLISH ===
-    # Articles & determiners
-    'a', 'an', 'the', 'this', 'that', 'these', 'those', 'some', 'any', 'each', 'every',
-    # Pronouns
-    'i', 'me', 'my', 'mine', 'myself',
-    'you', 'your', 'yours', 'yourself',
-    'he', 'him', 'his', 'himself',
-    'she', 'her', 'hers', 'herself',
-    'it', 'its', 'itself',
-    'we', 'us', 'our', 'ours', 'ourselves',
-    'they', 'them', 'their', 'theirs', 'themselves',
-    # Be/have/do verbs
-    'is', 'am', 'are', 'was', 'were', 'be', 'been', 'being',
-    'has', 'have', 'had', 'having',
-    'do', 'does', 'did', 'doing', 'done',
-    # Modal verbs
-    'can', 'could', 'will', 'would', 'shall', 'should', 'may', 'might', 'must',
-    # Common verbs
-    'get', 'gets', 'got', 'getting',
-    'go', 'goes', 'went', 'going', 'gone',
-    'make', 'makes', 'made', 'making',
-    'come', 'comes', 'came', 'coming',
-    'take', 'takes', 'took', 'taking', 'taken',
-    'give', 'gives', 'gave', 'given',
-    'say', 'says', 'said',
-    'know', 'knows', 'knew', 'known',
-    'see', 'sees', 'saw', 'seen',
-    'use', 'uses', 'used', 'using',
-    'find', 'finds', 'found',
-    'want', 'need', 'keep', 'let', 'put', 'set', 'run', 'show',
-    # Prepositions & conjunctions
-    'at', 'by', 'for', 'from', 'in', 'into', 'of', 'on', 'to', 'with',
-    'about', 'after', 'before', 'between', 'through', 'during', 'without',
-    'above', 'below', 'under', 'over', 'up', 'down', 'out', 'off',
-    'and', 'but', 'or', 'nor', 'so', 'yet', 'both', 'either', 'neither',
-    'if', 'then', 'than', 'when', 'where', 'while', 'because', 'since', 'until', 'although',
-    # Adverbs
-    'not', 'no', 'also', 'very', 'just', 'only', 'even', 'still', 'already',
-    'always', 'never', 'often', 'usually', 'generally', 'sometimes',
-    'here', 'there', 'now', 'again', 'once',
-    'how', 'what', 'which', 'who', 'whom', 'whose', 'why',
-    # Other common
-    'own', 'other', 'another', 'such', 'much', 'many', 'more', 'most',
-    'all', 'few', 'less', 'same', 'well', 'back',
-    'new', 'old', 'first', 'last', 'long', 'great', 'little', 'right',
-    'big', 'high', 'different', 'small', 'large', 'next', 'early',
-    'able', 'like', 'however', 'way', 'thing', 'things',
-    'as',
-    # === DEUTSCH ===
-    # Artikel & Determinanten
-    'der', 'die', 'das', 'den', 'dem', 'des',
-    'ein', 'eine', 'einer', 'einem', 'einen', 'eines',
-    'kein', 'keine', 'keiner', 'keinem', 'keinen', 'keines',
-    # Pronomen
-    'ich', 'du', 'er', 'sie', 'es', 'wir', 'ihr',
-    'mich', 'dich', 'sich', 'uns', 'euch',
-    'mir', 'dir', 'ihm', 'ihnen',
-    'mein', 'dein', 'sein', 'unser', 'euer',
-    'dieser', 'diese', 'dieses', 'jener', 'jene', 'jenes',
-    'man', 'was', 'wer', 'welche', 'welcher', 'welches',
-    # Verben (sein/haben/werden)
-    'ist', 'bin', 'bist', 'sind', 'seid', 'war', 'waren', 'gewesen',
-    'hat', 'habe', 'hast', 'haben', 'habt', 'hatte', 'hatten',
-    'wird', 'werde', 'wirst', 'werden', 'werdet', 'wurde', 'wurden',
-    # Modalverben
-    'kann', 'kannst', 'muss', 'soll', 'darf', 'mag', 'will',
-    # Präpositionen & Konjunktionen
-    'auf', 'aus', 'bei', 'bis', 'durch', 'nach', 'ohne', 'um', 'unter',
-    'vor', 'zwischen', 'gegen', 'seit', 'von', 'zu', 'zum', 'zur',
-    'mit', 'als', 'wie', 'ob', 'dass', 'weil', 'wenn', 'aber', 'oder',
-    'und', 'denn', 'sondern', 'nicht', 'noch', 'schon', 'auch', 'nur',
-    'so', 'da', 'dann', 'doch', 'sehr', 'immer', 'hier', 'dort',
-    # Andere häufige
-    'andere', 'anderer', 'anderes', 'anderen',
-    'alle', 'alles', 'allem', 'allen', 'aller',
-    'viel', 'viele', 'mehr', 'ganz', 'etwa', 'dabei',
-]
-
-# Safety net: cap OR-terms to prevent fulltext explosion on long queries.
-# RediSearch OR-queries (term1 | term2 | ... | termN) scale linearly with term count —
-# each term traverses a separate posting list and all matches get BM25-scored.
-MAX_FULLTEXT_TERMS = 5
 
 
 class FalkorDriverSession(GraphDriverSession):
@@ -199,6 +147,19 @@ class FalkorDriver(GraphDriver):
         else:
             self.client = FalkorDB(host=host, port=port, username=username, password=password)
 
+        # Instantiate FalkorDB operations
+        self._entity_node_ops = FalkorEntityNodeOperations()
+        self._episode_node_ops = FalkorEpisodeNodeOperations()
+        self._community_node_ops = FalkorCommunityNodeOperations()
+        self._saga_node_ops = FalkorSagaNodeOperations()
+        self._entity_edge_ops = FalkorEntityEdgeOperations()
+        self._episodic_edge_ops = FalkorEpisodicEdgeOperations()
+        self._community_edge_ops = FalkorCommunityEdgeOperations()
+        self._has_episode_edge_ops = FalkorHasEpisodeEdgeOperations()
+        self._next_episode_edge_ops = FalkorNextEpisodeEdgeOperations()
+        self._search_ops = FalkorSearchOperations()
+        self._graph_ops = FalkorGraphMaintenanceOperations()
+
         # Schedule the indices and constraints to be built (unless skipped for cloned drivers)
         if not _skip_index_init:
             try:
@@ -209,6 +170,52 @@ class FalkorDriver(GraphDriver):
             except RuntimeError:
                 # No event loop running, this will be handled later
                 pass
+
+    # --- Operations properties ---
+
+    @property
+    def entity_node_ops(self) -> EntityNodeOperations:
+        return self._entity_node_ops
+
+    @property
+    def episode_node_ops(self) -> EpisodeNodeOperations:
+        return self._episode_node_ops
+
+    @property
+    def community_node_ops(self) -> CommunityNodeOperations:
+        return self._community_node_ops
+
+    @property
+    def saga_node_ops(self) -> SagaNodeOperations:
+        return self._saga_node_ops
+
+    @property
+    def entity_edge_ops(self) -> EntityEdgeOperations:
+        return self._entity_edge_ops
+
+    @property
+    def episodic_edge_ops(self) -> EpisodicEdgeOperations:
+        return self._episodic_edge_ops
+
+    @property
+    def community_edge_ops(self) -> CommunityEdgeOperations:
+        return self._community_edge_ops
+
+    @property
+    def has_episode_edge_ops(self) -> HasEpisodeEdgeOperations:
+        return self._has_episode_edge_ops
+
+    @property
+    def next_episode_edge_ops(self) -> NextEpisodeEdgeOperations:
+        return self._next_episode_edge_ops
+
+    @property
+    def search_ops(self) -> SearchOperations:
+        return self._search_ops
+
+    @property
+    def graph_ops(self) -> GraphMaintenanceOperations:
+        return self._graph_ops
 
     def _get_graph(self, graph_name: str | None) -> FalkorGraph:
         # FalkorDB requires a non-None database name for multi-tenant graphs; the default is "default_db"
