@@ -477,6 +477,7 @@ class EntityEdge(Edge):
         limit: int | None = None,
         uuid_cursor: str | None = None,
         with_embeddings: bool = False,
+        lightweight: bool = False,
     ):
         if driver.graph_operations_interface:
             try:
@@ -513,7 +514,7 @@ class EntityEdge(Edge):
             + """
             RETURN
             """
-            + get_entity_edge_return_query(driver.provider)
+            + get_entity_edge_return_query(driver.provider, lightweight=lightweight)
             + with_embeddings_query
             + """
             ORDER BY e.uuid DESC
@@ -525,7 +526,10 @@ class EntityEdge(Edge):
             routing_='r',
         )
 
-        edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
+        edges = [
+            get_entity_edge_from_record(record, driver.provider, lightweight=lightweight)
+            for record in records
+        ]
 
         if len(edges) == 0:
             raise GroupsEdgesNotFoundError(group_ids)
@@ -957,10 +961,16 @@ def get_episodic_edge_from_record(record: Any) -> EpisodicEdge:
     )
 
 
-def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityEdge:
+def get_entity_edge_from_record(
+    record: Any, provider: GraphProvider, lightweight: bool = False
+) -> EntityEdge:
     episodes = record['episodes']
     if provider == GraphProvider.KUZU:
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
+    elif lightweight:
+        # List comprehension returns [[key, value], ...] pairs
+        raw_attrs = record.get('attributes', [])
+        attributes = {pair[0]: pair[1] for pair in raw_attrs} if raw_attrs else {}
     else:
         attributes = record['attributes']
         attributes.pop('uuid', None)

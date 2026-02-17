@@ -656,6 +656,7 @@ class EntityNode(Node):
         limit: int | None = None,
         uuid_cursor: str | None = None,
         with_embeddings: bool = False,
+        lightweight: bool = False,
     ):
         if driver.graph_operations_interface:
             try:
@@ -684,7 +685,7 @@ class EntityNode(Node):
             + """
             RETURN
             """
-            + get_entity_node_return_query(driver.provider)
+            + get_entity_node_return_query(driver.provider, lightweight=lightweight)
             + with_embeddings_query
             + """
             ORDER BY n.uuid DESC
@@ -696,7 +697,10 @@ class EntityNode(Node):
             routing_='r',
         )
 
-        nodes = [get_entity_node_from_record(record, driver.provider) for record in records]
+        nodes = [
+            get_entity_node_from_record(record, driver.provider, lightweight=lightweight)
+            for record in records
+        ]
 
         return nodes
 
@@ -1086,9 +1090,15 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
     )
 
 
-def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityNode:
+def get_entity_node_from_record(
+    record: Any, provider: GraphProvider, lightweight: bool = False
+) -> EntityNode:
     if provider == GraphProvider.KUZU:
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
+    elif lightweight:
+        # List comprehension returns [[key, value], ...] pairs
+        raw_attrs = record.get('attributes', [])
+        attributes = {pair[0]: pair[1] for pair in raw_attrs} if raw_attrs else {}
     else:
         attributes = record['attributes']
         attributes.pop('uuid', None)

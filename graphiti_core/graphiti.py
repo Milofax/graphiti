@@ -2028,6 +2028,7 @@ class Graphiti:
         group_id: str,
         limit: int | None = None,
         uuid_cursor: str | None = None,
+        lightweight: bool = False,
     ) -> list[EntityNode]:
         """
         Retrieve entity nodes by group ID with pagination support.
@@ -2040,6 +2041,9 @@ class Graphiti:
             Maximum number of entities to return.
         uuid_cursor : str | None, optional
             UUID cursor for pagination.
+        lightweight : bool, optional
+            If True, exclude embedding vectors from the query for better performance
+            when loading many nodes. Defaults to False.
 
         Returns
         -------
@@ -2052,7 +2056,7 @@ class Graphiti:
             driver = driver.clone(database=group_id)
 
         return await EntityNode.get_by_group_ids(
-            driver, [group_id], limit=limit, uuid_cursor=uuid_cursor
+            driver, [group_id], limit=limit, uuid_cursor=uuid_cursor, lightweight=lightweight
         )
 
     async def get_edges_by_group_id(
@@ -2060,6 +2064,7 @@ class Graphiti:
         group_id: str,
         limit: int | None = None,
         uuid_cursor: str | None = None,
+        lightweight: bool = False,
     ) -> list[EntityEdge]:
         """
         Retrieve entity edges by group ID with pagination support.
@@ -2072,6 +2077,9 @@ class Graphiti:
             Maximum number of edges to return.
         uuid_cursor : str | None, optional
             UUID cursor for pagination.
+        lightweight : bool, optional
+            If True, exclude embedding vectors from the query for better performance
+            when loading many edges. Defaults to False.
 
         Returns
         -------
@@ -2084,7 +2092,7 @@ class Graphiti:
             driver = driver.clone(database=group_id)
 
         return await EntityEdge.get_by_group_ids(
-            driver, [group_id], limit=limit, uuid_cursor=uuid_cursor
+            driver, [group_id], limit=limit, uuid_cursor=uuid_cursor, lightweight=lightweight
         )
 
     async def get_episodes_by_group_id(

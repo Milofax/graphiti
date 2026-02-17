@@ -1112,10 +1112,12 @@ async def list_nodes(
         effective_limit = min(max(1, limit), 500)
 
         # Get nodes with pagination (request one extra to check if there are more)
+        # Use lightweight=True to exclude embedding vectors for better performance
         nodes = await client.get_entities_by_group_id(
             group_id=effective_group_id,
             limit=effective_limit + 1,
             uuid_cursor=cursor,
+            lightweight=True,
         )
 
         # Check if there are more results
@@ -1182,10 +1184,12 @@ async def list_edges(
         effective_limit = min(max(1, limit), 500)
 
         # Get edges with pagination (request one extra to check if there are more)
+        # Use lightweight=True to exclude embedding vectors for better performance
         edges = await client.get_edges_by_group_id(
             group_id=effective_group_id,
             limit=effective_limit + 1,
             uuid_cursor=cursor,
+            lightweight=True,
         )
 
         # Check if there are more results
