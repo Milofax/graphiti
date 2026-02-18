@@ -1,7 +1,7 @@
 """
-Integration tests for lightweight query mode.
+Integration tests for query mode.
 
-Validates that lightweight queries exclude embedding vectors while preserving
+Validates that queries exclude embedding vectors while preserving
 all other properties (including custom attributes like `labels`, `migrated_from`).
 
 Run with:
@@ -16,6 +16,10 @@ import numpy as np
 import pytest
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.record_parsers import (
+    entity_edge_from_record,
+    entity_node_from_record,
+)
 from graphiti_core.edges import EntityEdge, get_entity_edge_from_record
 from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.models.nodes.node_db_queries import get_entity_node_return_query
@@ -29,8 +33,19 @@ from tests.helpers_test import embedding_dim, group_id
 # ──────────────────────────────────────────────
 
 
-class TestLightweightNodeQuery:
-    """Unit tests for get_entity_node_return_query with lightweight=True."""
+class TestNodeQuery:
+    """Unit tests for get_entity_node_return_query — default and lightweight."""
+
+    def test_default_excludes_properties_call(self):
+        """Default mode must NOT use properties(n) — embeddings excluded at query level."""
+        query = get_entity_node_return_query(GraphProvider.FALKORDB, lightweight=False)
+        assert 'properties(n)' not in query
+
+    def test_default_has_embedding_exclusion_list(self):
+        """Default mode must exclude name_embedding and summary_embedding."""
+        query = get_entity_node_return_query(GraphProvider.FALKORDB, lightweight=False)
+        assert 'name_embedding' in query  # in the exclusion list
+        assert 'summary_embedding' in query  # in the exclusion list
 
     def test_lightweight_excludes_properties_call(self):
         query = get_entity_node_return_query(GraphProvider.FALKORDB, lightweight=True)
@@ -49,18 +64,24 @@ class TestLightweightNodeQuery:
         assert 'n.summary AS summary' in query
         assert 'labels(n) AS labels' in query
 
-    def test_non_lightweight_uses_properties(self):
-        query = get_entity_node_return_query(GraphProvider.FALKORDB, lightweight=False)
-        assert 'properties(n) AS attributes' in query
-
     def test_kuzu_ignores_lightweight(self):
         query_lw = get_entity_node_return_query(GraphProvider.KUZU, lightweight=True)
         query_normal = get_entity_node_return_query(GraphProvider.KUZU, lightweight=False)
         assert query_lw == query_normal  # KUZU doesn't have the problem
 
 
-class TestLightweightEdgeQuery:
-    """Unit tests for get_entity_edge_return_query with lightweight=True."""
+class TestEdgeQuery:
+    """Unit tests for get_entity_edge_return_query — default and lightweight."""
+
+    def test_default_excludes_properties_call(self):
+        """Default mode must NOT use properties(e) — embeddings excluded at query level."""
+        query = get_entity_edge_return_query(GraphProvider.FALKORDB, lightweight=False)
+        assert 'properties(e)' not in query
+
+    def test_default_has_embedding_exclusion_list(self):
+        """Default mode must exclude fact_embedding."""
+        query = get_entity_edge_return_query(GraphProvider.FALKORDB, lightweight=False)
+        assert 'fact_embedding' in query  # in the exclusion list
 
     def test_lightweight_excludes_properties_call(self):
         query = get_entity_edge_return_query(GraphProvider.FALKORDB, lightweight=True)
@@ -76,9 +97,11 @@ class TestLightweightEdgeQuery:
         assert 'e.fact AS fact' in query
         assert 'e.name AS name' in query
 
-    def test_non_lightweight_uses_properties(self):
-        query = get_entity_edge_return_query(GraphProvider.FALKORDB, lightweight=False)
-        assert 'properties(e) AS attributes' in query
+    def test_neptune_default_excludes_properties(self):
+        """Neptune default should use [] AS attributes (no properties(e))."""
+        query = get_entity_edge_return_query(GraphProvider.NEPTUNE, lightweight=False)
+        assert 'properties(e)' not in query
+        assert '[] AS attributes' in query
 
     def test_neptune_lightweight(self):
         query = get_entity_edge_return_query(GraphProvider.NEPTUNE, lightweight=True)
@@ -87,12 +110,32 @@ class TestLightweightEdgeQuery:
 
 
 # ──────────────────────────────────────────────
-# Unit Tests: Record parser
+# Unit Tests: API-level record parser (Set B)
 # ──────────────────────────────────────────────
 
 
 class TestNodeRecordParser:
-    """Unit tests for get_entity_node_from_record with lightweight mode."""
+    """Unit tests for get_entity_node_from_record (Set B parser in nodes.py)."""
+
+    def test_default_parses_list_of_pairs(self):
+        """Default mode now returns [[key, value], ...] — must handle like lightweight."""
+        record = {
+            'uuid': 'test-uuid',
+            'name': 'Test Node',
+            'group_id': 'main',
+            'created_at': '2026-01-01T00:00:00Z',
+            'summary': 'A test node',
+            'labels': ['Entity', 'Concept'],
+            'attributes': [
+                ['labels', ['Entity', 'Concept']],
+                ['migrated_from', 'old-group'],
+            ],
+        }
+        node = get_entity_node_from_record(record, GraphProvider.FALKORDB, lightweight=False)
+        assert node.attributes == {
+            'labels': ['Entity', 'Concept'],
+            'migrated_from': 'old-group',
+        }
 
     def test_lightweight_parses_list_of_pairs(self):
         record = {
@@ -142,7 +185,26 @@ class TestNodeRecordParser:
 
 
 class TestEdgeRecordParser:
-    """Unit tests for get_entity_edge_from_record with lightweight mode."""
+    """Unit tests for get_entity_edge_from_record (Set B parser in edges.py)."""
+
+    def test_default_parses_list_of_pairs(self):
+        """Default mode now returns [[key, value], ...] — must handle like lightweight."""
+        record = {
+            'uuid': 'test-uuid',
+            'source_node_uuid': 'src-uuid',
+            'target_node_uuid': 'tgt-uuid',
+            'group_id': 'main',
+            'created_at': '2026-01-01T00:00:00Z',
+            'name': 'RELATES_TO',
+            'fact': 'A relates to B',
+            'episodes': ['ep1'],
+            'expired_at': None,
+            'valid_at': None,
+            'invalid_at': None,
+            'attributes': [['custom_key', 'custom_val']],
+        }
+        edge = get_entity_edge_from_record(record, GraphProvider.FALKORDB, lightweight=False)
+        assert edge.attributes == {'custom_key': 'custom_val'}
 
     def test_lightweight_parses_list_of_pairs(self):
         record = {
@@ -179,6 +241,93 @@ class TestEdgeRecordParser:
             'attributes': [],
         }
         edge = get_entity_edge_from_record(record, GraphProvider.FALKORDB, lightweight=True)
+        assert edge.attributes == {}
+
+
+# ──────────────────────────────────────────────
+# Unit Tests: Driver-level record parser (Set A)
+# ──────────────────────────────────────────────
+
+
+class TestDriverNodeRecordParser:
+    """Unit tests for record_parsers.entity_node_from_record (Set A parser)."""
+
+    def test_parses_list_of_pairs(self):
+        """Driver-level parser must handle [[key, value], ...] format from Cypher."""
+        record = {
+            'uuid': 'test-uuid',
+            'name': 'Test Node',
+            'group_id': 'main',
+            'created_at': '2026-01-01T00:00:00Z',
+            'summary': 'A test node',
+            'labels': ['Entity', 'Concept'],
+            'attributes': [
+                ['migrated_from', 'old-group'],
+                ['custom_flag', True],
+            ],
+        }
+        node = entity_node_from_record(record)
+        assert node.attributes == {
+            'migrated_from': 'old-group',
+            'custom_flag': True,
+        }
+        # Embeddings not in record → None
+        assert node.name_embedding is None
+
+    def test_empty_attributes(self):
+        record = {
+            'uuid': 'test-uuid',
+            'name': 'Test Node',
+            'group_id': 'main',
+            'created_at': '2026-01-01T00:00:00Z',
+            'summary': '',
+            'labels': ['Entity'],
+            'attributes': [],
+        }
+        node = entity_node_from_record(record)
+        assert node.attributes == {}
+
+
+class TestDriverEdgeRecordParser:
+    """Unit tests for record_parsers.entity_edge_from_record (Set A parser)."""
+
+    def test_parses_list_of_pairs(self):
+        """Driver-level parser must handle [[key, value], ...] format from Cypher."""
+        record = {
+            'uuid': 'test-uuid',
+            'source_node_uuid': 'src-uuid',
+            'target_node_uuid': 'tgt-uuid',
+            'group_id': 'main',
+            'created_at': '2026-01-01T00:00:00Z',
+            'name': 'RELATES_TO',
+            'fact': 'A relates to B',
+            'episodes': ['ep1'],
+            'expired_at': None,
+            'valid_at': None,
+            'invalid_at': None,
+            'attributes': [['custom_key', 'custom_val']],
+        }
+        edge = entity_edge_from_record(record)
+        assert edge.attributes == {'custom_key': 'custom_val'}
+        # Embedding not in record → None
+        assert edge.fact_embedding is None
+
+    def test_empty_attributes(self):
+        record = {
+            'uuid': 'test-uuid',
+            'source_node_uuid': 'src-uuid',
+            'target_node_uuid': 'tgt-uuid',
+            'group_id': 'main',
+            'created_at': '2026-01-01T00:00:00Z',
+            'name': 'RELATES_TO',
+            'fact': 'A relates to B',
+            'episodes': [],
+            'expired_at': None,
+            'valid_at': None,
+            'invalid_at': None,
+            'attributes': [],
+        }
+        edge = entity_edge_from_record(record)
         assert edge.attributes == {}
 
 

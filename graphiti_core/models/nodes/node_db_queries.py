@@ -303,7 +303,7 @@ def get_entity_node_return_query(provider: GraphProvider, lightweight: bool = Fa
         n.created_at AS created_at,
         n.summary AS summary,
         labels(n) AS labels,
-        properties(n) AS attributes
+        [k IN keys(n) WHERE NOT k IN ['uuid','name','group_id','created_at','summary','name_embedding','summary_embedding'] | [k, n[k]]] AS attributes
     """
 
 

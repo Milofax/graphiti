@@ -252,7 +252,7 @@ async def edge_fulltext_search(
                     e.expired_at AS expired_at,
                     e.valid_at AS valid_at,
                     e.invalid_at AS invalid_at,
-                    properties(e) AS attributes
+                    [] AS attributes
                 ORDER BY score DESC LIMIT $limit
                             """
             )
@@ -539,7 +539,7 @@ async def edge_bfs_search(
                     e.expired_at AS expired_at,
                     e.valid_at AS valid_at,
                     e.invalid_at AS invalid_at,
-                    properties(e) AS attributes
+                    [] AS attributes
                 LIMIT $limit
                 """
             )
@@ -1590,7 +1590,7 @@ async def get_relevant_edges(
                 expired_at: e.expired_at,
                 valid_at: e.valid_at,
                 invalid_at: e.invalid_at,
-                attributes: properties(e)
+                attributes: []
             })[..$limit] AS matches
                 """
 
@@ -1679,7 +1679,7 @@ async def get_relevant_edges(
                         expired_at: e.expired_at,
                         valid_at: e.valid_at,
                         invalid_at: e.invalid_at,
-                        attributes: properties(e)
+                        attributes: [k IN keys(e) WHERE NOT k IN ['uuid','source_node_uuid','target_node_uuid','group_id','created_at','name','fact','episodes','expired_at','valid_at','invalid_at','fact_embedding'] | [k, e[k]]]
                     })[..$limit] AS matches
                 """
             )
@@ -1777,7 +1777,7 @@ async def get_edge_invalidation_candidates(
                 expired_at: e.expired_at,
                 valid_at: e.valid_at,
                 invalid_at: e.invalid_at,
-                attributes: properties(e)
+                attributes: []
             })[..$limit] AS matches
                 """
         results, _, _ = await driver.execute_query(
@@ -1867,7 +1867,7 @@ async def get_edge_invalidation_candidates(
                         expired_at: e.expired_at,
                         valid_at: e.valid_at,
                         invalid_at: e.invalid_at,
-                        attributes: properties(e)
+                        attributes: [k IN keys(e) WHERE NOT k IN ['uuid','source_node_uuid','target_node_uuid','group_id','created_at','name','fact','episodes','expired_at','valid_at','invalid_at','fact_embedding'] | [k, e[k]]]
                     })[..$limit] AS matches
                 """
             )

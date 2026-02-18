@@ -967,24 +967,10 @@ def get_entity_edge_from_record(
     episodes = record['episodes']
     if provider == GraphProvider.KUZU:
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
-    elif lightweight:
-        # List comprehension returns [[key, value], ...] pairs
+    else:
+        # Both default and lightweight now return [[key, value], ...] pairs
         raw_attrs = record.get('attributes', [])
         attributes = {pair[0]: pair[1] for pair in raw_attrs} if raw_attrs else {}
-    else:
-        attributes = record['attributes']
-        attributes.pop('uuid', None)
-        attributes.pop('source_node_uuid', None)
-        attributes.pop('target_node_uuid', None)
-        attributes.pop('fact', None)
-        attributes.pop('fact_embedding', None)
-        attributes.pop('name', None)
-        attributes.pop('group_id', None)
-        attributes.pop('episodes', None)
-        attributes.pop('created_at', None)
-        attributes.pop('expired_at', None)
-        attributes.pop('valid_at', None)
-        attributes.pop('invalid_at', None)
 
     edge = EntityEdge(
         uuid=record['uuid'],

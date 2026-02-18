@@ -209,7 +209,7 @@ def get_entity_edge_return_query(provider: GraphProvider, lightweight: bool = Fa
         e.expired_at AS expired_at,
         e.valid_at AS valid_at,
         e.invalid_at AS invalid_at,
-        properties(e) AS attributes
+        [] AS attributes
     """
 
     if lightweight:
@@ -246,7 +246,7 @@ def get_entity_edge_return_query(provider: GraphProvider, lightweight: bool = Fa
     """ + (
         'e.attributes AS attributes'
         if provider == GraphProvider.KUZU
-        else 'properties(e) AS attributes'
+        else "[k IN keys(e) WHERE NOT k IN ['uuid','source_node_uuid','target_node_uuid','group_id','created_at','name','fact','episodes','expired_at','valid_at','invalid_at','fact_embedding'] | [k, e[k]]] AS attributes"
     )
 
 

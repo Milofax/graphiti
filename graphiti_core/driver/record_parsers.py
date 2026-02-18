@@ -23,14 +23,9 @@ from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, Episodic
 
 def entity_node_from_record(record: Any) -> EntityNode:
     """Parse an entity node from a database record."""
-    attributes = record['attributes']
-    attributes.pop('uuid', None)
-    attributes.pop('name', None)
-    attributes.pop('group_id', None)
-    attributes.pop('name_embedding', None)
-    attributes.pop('summary', None)
-    attributes.pop('created_at', None)
-    attributes.pop('labels', None)
+    # Attributes come as [[key, value], ...] pairs from Cypher list comprehension
+    raw_attrs = record.get('attributes', [])
+    attributes = {pair[0]: pair[1] for pair in raw_attrs} if raw_attrs else {}
 
     labels = record.get('labels', [])
     group_id = record.get('group_id')
@@ -52,19 +47,9 @@ def entity_node_from_record(record: Any) -> EntityNode:
 
 def entity_edge_from_record(record: Any) -> EntityEdge:
     """Parse an entity edge from a database record."""
-    attributes = record['attributes']
-    attributes.pop('uuid', None)
-    attributes.pop('source_node_uuid', None)
-    attributes.pop('target_node_uuid', None)
-    attributes.pop('fact', None)
-    attributes.pop('fact_embedding', None)
-    attributes.pop('name', None)
-    attributes.pop('group_id', None)
-    attributes.pop('episodes', None)
-    attributes.pop('created_at', None)
-    attributes.pop('expired_at', None)
-    attributes.pop('valid_at', None)
-    attributes.pop('invalid_at', None)
+    # Attributes come as [[key, value], ...] pairs from Cypher list comprehension
+    raw_attrs = record.get('attributes', [])
+    attributes = {pair[0]: pair[1] for pair in raw_attrs} if raw_attrs else {}
 
     return EntityEdge(
         uuid=record['uuid'],

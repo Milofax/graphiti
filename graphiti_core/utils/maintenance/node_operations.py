@@ -112,8 +112,8 @@ def _build_entity_types_context(
             'entity_type_id': 0,
             'entity_type_name': 'Entity',
             'entity_type_description': (
-                'Default entity classification. Use this entity type '
-                'if the entity is not one of the other listed types.'
+                'Generic fallback — AVOID. Only use when the entity genuinely does not '
+                'fit ANY of the other listed types. Prefer a specific type.'
             ),
         }
     ]
